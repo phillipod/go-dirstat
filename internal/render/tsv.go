@@ -17,7 +17,7 @@ func TSV(w io.Writer, root *tree.Node, displayRoot string, opts TextOptions) err
 	root.Sort(opts.Sort, opts.Size)
 	r := tsvRenderer{
 		w:    w,
-		root: filepath.Clean(displayRoot),
+		root: filepath.ToSlash(filepath.Clean(displayRoot)),
 		opts: opts,
 	}
 	return r.node(root, "", 0)
@@ -58,9 +58,9 @@ func qualifiedPath(root, rel string) string {
 		return root
 	}
 	if root == "." {
-		return "." + string(filepath.Separator) + rel
+		return "./" + filepath.ToSlash(rel)
 	}
-	return filepath.Join(root, rel)
+	return filepath.ToSlash(filepath.Join(root, rel))
 }
 
 // escapeTSVPath makes arbitrary filesystem byte strings safe for a line-based

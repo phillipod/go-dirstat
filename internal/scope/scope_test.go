@@ -1,6 +1,10 @@
 package scope
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestPolicyVirtualAlwaysExcluded(t *testing.T) {
 	p := New()
@@ -170,6 +174,23 @@ func TestPolicyPathPrefixUsesComponentBoundaries(t *testing.T) {
 	}
 	if !p.AllowsPath("/tmp/database") {
 		t.Fatal("lexically similar sibling was excluded")
+	}
+}
+
+func TestPolicyPathPrefixResolvesSymlinkAliases(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	alias := filepath.Join(base, "alias")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, alias); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	p := New(WithExcludePaths([]string{alias}))
+	if p.AllowsPath(filepath.Join(target, "child")) {
+		t.Fatalf("target reached through symlink alias: alias=%q target=%q", alias, target)
 	}
 }
 

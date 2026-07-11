@@ -1,4 +1,4 @@
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package scan
 
@@ -14,3 +14,11 @@ func devOf(fs.FileInfo) uint64 { return 0 }
 func identityOf(fs.FileInfo) (dev, ino uint64, ok bool) { return 0, 0, false }
 
 func linkCount(fs.FileInfo) uint64 { return 0 }
+
+func devOfPath(_ string, info fs.FileInfo) uint64 { return devOf(info) }
+
+func identityOfPath(_ string, info fs.FileInfo) (dev, ino uint64, ok bool) {
+	return identityOf(info)
+}
+
+func linkCountPath(_ string, info fs.FileInfo) uint64 { return linkCount(info) }

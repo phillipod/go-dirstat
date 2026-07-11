@@ -46,3 +46,14 @@ func linkCount(info fs.FileInfo) uint64 {
 	}
 	return 0
 }
+
+// Path-aware wrappers keep the scanner portable while allowing platforms such
+// as Windows to obtain stable identities from an open handle. Unix stat data
+// already carries everything needed, so no extra I/O is required here.
+func devOfPath(_ string, info fs.FileInfo) uint64 { return devOf(info) }
+
+func identityOfPath(_ string, info fs.FileInfo) (dev, ino uint64, ok bool) {
+	return identityOf(info)
+}
+
+func linkCountPath(_ string, info fs.FileInfo) uint64 { return linkCount(info) }

@@ -7,6 +7,7 @@ package scope
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -232,7 +233,10 @@ func (p *Policy) includedPath(abs string) bool {
 		return true
 	}
 	for _, ip := range p.IncludePaths {
-		if pathWithin(ip, abs) || pathWithin(abs, ip) {
+		// Keep include paths lexical. A symlink used as the include root must
+		// not silently turn its resolved target into an additional whitelist;
+		// the scanner separately checks the resolved target before following it.
+		if pathWithinClean(filepath.Clean(ip), filepath.Clean(abs)) || pathWithinClean(filepath.Clean(abs), filepath.Clean(ip)) {
 			return true
 		}
 	}
@@ -243,11 +247,41 @@ func (p *Policy) includedPath(abs string) bool {
 // path-component boundary. filepath.Rel handles root paths, platform-specific
 // separators, and misleading lexical prefixes such as /tmp/data-old.
 func pathWithin(parent, child string) bool {
-	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
+	parent = filepath.Clean(parent)
+	child = filepath.Clean(child)
+	if pathWithinClean(parent, child) {
+		return true
+	}
+	// Most entries match lexically. Only pay for filesystem alias resolution
+	// when that fast path fails (for example /var vs /private/var on macOS).
+	return pathWithinClean(canonicalComparePath(parent), canonicalComparePath(child))
+}
+
+func pathWithinClean(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
 	if err != nil || filepath.IsAbs(rel) {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// canonicalComparePath normalizes aliases before applying path policies.
+// macOS commonly exposes /var as a symlink to /private/var; Windows may also
+// return short/long path spellings for the same target. Resolution is best
+// effort so policies still work for synthetic or not-yet-created paths.
+func canonicalComparePath(path string) string {
+	path = filepath.Clean(path)
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
 }
 
 func isHidden(name string) bool {

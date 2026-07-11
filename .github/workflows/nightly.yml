@@ -28,11 +28,19 @@ jobs:
             go-version: stable
             exe: ''
             symlinks: true
+          - os: ubuntu-24.04-arm
+            go-version: '1.24.x'
+            exe: ''
+            symlinks: true
           - os: macos-latest
             go-version: '1.24.x'
             exe: ''
             symlinks: true
           - os: windows-latest
+            go-version: '1.24.x'
+            exe: .exe
+            symlinks: false
+          - os: windows-11-arm
             go-version: '1.24.x'
             exe: .exe
             symlinks: false

@@ -133,10 +133,6 @@ func (c *Config) validate() error {
 	if c.CrossDevice && c.OneFileSystem {
 		return errors.New("--cross-device and --one-file-system cannot be used together")
 	}
-	if runtime.GOOS != "linux" && (len(c.IncludeFS) > 0 || len(c.ExcludeFS) > 0) {
-		return errors.New("--include-fs and --exclude-fs are currently supported only on Linux")
-	}
-
 	if !validSortMode(c.Sort) {
 		return fmt.Errorf("invalid --sort %q: expected size, size-asc, count, mtime, or name", c.Sort)
 	}
@@ -190,6 +186,9 @@ func (c *Config) validate() error {
 		if excludeFS[name] {
 			return fmt.Errorf("filesystem type %q cannot appear in both --include-fs and --exclude-fs", name)
 		}
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" && (len(c.IncludeFS) > 0 || len(c.ExcludeFS) > 0) {
+		return errors.New("--include-fs and --exclude-fs are currently supported only on Linux and macOS")
 	}
 	return nil
 }

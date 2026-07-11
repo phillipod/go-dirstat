@@ -1,9 +1,9 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package scope
 
-// On non-Linux platforms there is no mountinfo to read; fstype resolution is a
-// no-op and all fstype filters are inert (they simply match nothing/anything).
+// On platforms without a portable filesystem-type API, fstype resolution is a
+// no-op and filesystem filters are unavailable.
 type mountTable struct{}
 
 func loadMounts() *mountTable { return nil }

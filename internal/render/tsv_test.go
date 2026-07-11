@@ -3,7 +3,6 @@ package render
 import (
 	"errors"
 	"io"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -61,10 +60,9 @@ func TestTSVHumanDepthAndLimitOmitsSyntheticRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sep := string(filepath.Separator)
 	want := "3.50K\t.\n" +
-		"2.00K\t." + sep + "alpha\n" +
-		"1.00K\t." + sep + "beta\n"
+		"2.00K\t./alpha\n" +
+		"1.00K\t./beta\n"
 	if got := b.String(); got != want {
 		t.Fatalf("TSV output:\n%q\nwant:\n%q", got, want)
 	}

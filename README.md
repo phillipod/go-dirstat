@@ -52,8 +52,9 @@ go install ./cmd/dirstat
 
 The repository uses GitHub-hosted public runners exclusively:
 
-- **CI** runs on every pull request and `main` push across Linux, macOS, and
-  Windows, with tests, vet, the race detector, and golangci-lint.
+- **CI** runs on every pull request and `main` push across Linux (including a
+  native arm64 runner), macOS, and Windows (including a native arm64 runner),
+  with tests, vet, the race detector, and golangci-lint.
 - **Coverage** runs on pull requests, `main`, and a nightly schedule under the
   minimum supported Go line and the current stable Go release. Reports are
   retained as workflow artifacts with an 80% statement-coverage floor.
@@ -124,16 +125,16 @@ what you want. Defaults are the safe `du`-like behavior.
 | `--exclude GLOB` | — | exclude basename/path glob, `du --exclude` style (repeatable) |
 | `--exclude-path P` | — | exclude absolute path prefix (repeatable) |
 | `--include-path P` | — | scan **only** these path prefixes (repeatable) |
-| `--include-fs TYPE` | — | include **only** these filesystem types (Linux; repeatable) |
-| `--exclude-fs TYPE` | — | exclude these filesystem types (Linux; repeatable) |
+| `--include-fs TYPE` | — | include **only** these filesystem types (Linux/macOS; repeatable) |
+| `--exclude-fs TYPE` | — | exclude these filesystem types (Linux/macOS; repeatable) |
 | `--no-hidden` | off | skip dotfile entries |
 | `--min-size SIZE` | — | skip files with logical size smaller than SIZE (`10M`, `1G`, `1T`, …) |
 | `--max-size SIZE` | — | skip files with logical size larger than SIZE |
 | `-j, --jobs N` | GOMAXPROCS | concurrent directory workers (maximum 4096) |
 
-Filesystem-type filtering reads the mount table (`/proc/self/mountinfo` on
-Linux) to resolve each directory's fstype; those two flags fail clearly on
-other platforms rather than silently doing nothing. Examples:
+Filesystem-type filtering resolves each directory's fstype from Linux's mount
+table or macOS `statfs`; those two flags fail clearly on platforms without a
+filesystem-type API rather than silently doing nothing. Examples:
 
 ```bash
 # What's on the root filesystem only, ignoring the project's caches?
@@ -168,8 +169,9 @@ SIZE<TAB>PATH<LF>
 There is no header, summary, blank separator, percentage, count, bar, color,
 timing, filesystem label, or synthetic `--limit` row. Multiple roots are
 concatenated in argument order, and every path is qualified by its cleaned
-input root. The selected sort, size mode, depth, per-directory limit, and
-directories-only/`--files` behavior still apply.
+input root. Paths use `/` separators for stable cross-platform processing. The
+selected sort, size mode, depth, per-directory limit, and directories-only/`--files`
+behavior still apply.
 
 `SIZE` uses the usual compact human units (`B`, `K`, `M`, `G`, `T`, …), or an
 exact base-10 byte count with `--bytes`. `PATH` preserves spaces and printable

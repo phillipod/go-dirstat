@@ -98,6 +98,7 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 	if err != nil {
 		return nil, Stats{}, err
 	}
+	rootDisplay := filepath.Clean(root)
 	info, err := os.Lstat(rootAbs)
 	if err != nil {
 		return nil, Stats{}, err
@@ -126,14 +127,14 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 		}
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
 			"scan root %q is on filesystem %q, which is not allowed by the filesystem policy",
-			rootAbs,
+			rootDisplay,
 			fsName,
 		)
 	}
 	if !opts.Policy.AllowsPath(rootAbs) {
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
 			"scan root %q is not allowed by the path policy",
-			rootAbs,
+			rootDisplay,
 		)
 	}
 	if rootFSPath != rootAbs && !opts.Policy.AllowsPath(rootFSPath) {
@@ -145,7 +146,7 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 	if !info.IsDir() && !opts.Policy.File(info.Size()) {
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
 			"scan root file %q does not satisfy the size policy",
-			rootAbs,
+			rootDisplay,
 		)
 	}
 	s := &scanner{
@@ -165,7 +166,7 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 			// Seed the target inode before walking. Otherwise a symlink from a
 			// descendant back to the root is accepted once and the entire root
 			// subtree is measured a second time before the loop is noticed.
-			if dev, ino, ok := identityOf(info); ok {
+			if dev, ino, ok := identityOfPath(rootFSPath, info); ok {
 				s.visited[devIno{dev, ino}] = struct{}{}
 			} else {
 				s.visitedPaths[canonicalPath(rootFSPath)] = struct{}{}
@@ -198,7 +199,7 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 		s.startStatWorkers(opts.Concurrency)
 		node = &tree.Node{Name: filepath.Base(rootAbs), IsDir: true, Depth: 0}
 		lt.root = node
-		s.scanDir(rootAbs, "", info, devOf(info), rootFS, 0, node, lt)
+		s.scanDir(rootAbs, "", info, devOfPath(rootAbs, info), rootFS, 0, node, lt)
 		s.stopStatWorkers()
 		// Directory scans can discover the same file identity from concurrent
 		// branches (hardlinks or followed aliases). Streaming counts it once as
@@ -564,7 +565,7 @@ func (s *scanner) classifyEntry(abs, rel string, parentDev uint64, parentFS stri
 	if r.resolved != "" {
 		targetPath = r.resolved
 	}
-	childDev := devOf(info)
+	childDev := devOfPath(eabs, info)
 	childFS := parentFS
 	if childDev != parentDev || r.resolved != "" {
 		childFS = s.fstypeOf(targetPath)
@@ -693,7 +694,7 @@ func (s *scanner) markVisited(dev, ino uint64) bool {
 // platforms whose FileInfo has no device/inode fields: treating every entry as
 // (0,0) skips valid trees, while disabling tracking permits symlink loops.
 func (s *scanner) seenDirectory(path string, info fs.FileInfo) bool {
-	if dev, ino, ok := identityOf(info); ok {
+	if dev, ino, ok := identityOfPath(path, info); ok {
 		return s.markVisited(dev, ino)
 	}
 	resolved, err := filepath.EvalSymlinks(path)
@@ -747,8 +748,8 @@ func (s *scanner) deduplicatedFile(abs, resolved, name string, info fs.FileInfo,
 }
 
 func (s *scanner) fileIdentity(abs, resolved string, info fs.FileInfo) (fileKey, bool) {
-	if dev, ino, ok := identityOf(info); ok {
-		if s.opts.Policy.FollowSymlinks || linkCount(info) > 1 {
+	if dev, ino, ok := identityOfPath(abs, info); ok {
+		if s.opts.Policy.FollowSymlinks || linkCountPath(abs, info) > 1 {
 			return fileKey{dev: dev, ino: ino}, true
 		}
 		return fileKey{}, false

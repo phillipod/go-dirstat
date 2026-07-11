@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -140,7 +141,13 @@ func TestCommandTSVIsStableAcrossMultipleRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := t.TempDir()
-	if err := os.WriteFile(filepath.Join(second, "tab\tline\nbreak"), []byte("x"), 0o600); err != nil {
+	oddName := `tab\tline\nbreak`
+	if runtime.GOOS == "windows" {
+		// Windows reserves both backslash and control characters in names; the
+		// renderer package separately covers escaping those bytes.
+		oddName = "tab-line-break"
+	}
+	if err := os.WriteFile(filepath.Join(second, oddName), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -153,12 +160,12 @@ func TestCommandTSVIsStableAcrossMultipleRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := "5\t" + first + "\n" +
-		"3\t" + filepath.Join(first, "a file") + "\n" +
-		"2\t" + filepath.Join(first, "dir") + "\n" +
-		"2\t" + filepath.Join(first, "dir", "z") + "\n" +
-		"1\t" + second + "\n" +
-		"1\t" + filepath.Join(second, `tab\tline\nbreak`) + "\n"
+	want := "5\t" + filepath.ToSlash(first) + "\n" +
+		"3\t" + filepath.ToSlash(filepath.Join(first, "a file")) + "\n" +
+		"2\t" + filepath.ToSlash(filepath.Join(first, "dir")) + "\n" +
+		"2\t" + filepath.ToSlash(filepath.Join(first, "dir", "z")) + "\n" +
+		"1\t" + filepath.ToSlash(second) + "\n" +
+		"1\t" + strings.ReplaceAll(filepath.ToSlash(filepath.Join(second, oddName)), `\`, `\\`) + "\n"
 	if got := out.String(); got != want {
 		t.Fatalf("TSV output:\n%q\nwant:\n%q", got, want)
 	}
