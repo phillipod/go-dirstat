@@ -922,18 +922,18 @@ func (s *scanner) claimDirectory(path string, info fs.FileInfo) (*dirGroup, bool
 }
 
 func directoryIdentity(path string, info fs.FileInfo) dirKey {
-	// Windows junctions are reparse-point directories rather than symlinks in
-	// DirEntry metadata, and some native handles report the junction identity
-	// instead of the target identity. Resolve the path explicitly on Windows so
-	// a junction back to the root is still treated as an alias edge, not a new
-	// recursive directory.
+	// Prefer the native file identity first. Windows deliberately leaves
+	// same-volume junctions unchanged from EvalSymlinks (including recursive
+	// junctions), so path canonicalization alone cannot collapse a junction back
+	// to the root. Opening the followed path gives GetFileInformationByHandle
+	// the target's volume/file identity and keeps the alias edge non-recursive.
+	if dev, ino, ok := identityOfPath(path, info); ok {
+		return dirKey{dev: dev, ino: ino}
+	}
 	if runtime.GOOS == windowsOS {
 		if resolved, err := filepath.EvalSymlinks(path); err == nil {
 			return dirKey{path: canonicalPath(resolved)}
 		}
-	}
-	if dev, ino, ok := identityOfPath(path, info); ok {
-		return dirKey{dev: dev, ino: ino}
 	}
 	return fallbackDirectoryIdentity(path)
 }
