@@ -1,0 +1,36 @@
+# Axle architectural classification for dirstat.
+#
+# Encodes the intended layering so Axle's boundary analysis labels packages and
+# can flag dependency drift on future changes. Validation commands live in the
+# README architecture section.
+#
+# Layers (depend only downward):
+#   entrypoint  -> wiring -> presentation / domain -> foundation
+#
+# class_inference: architectural tier per package path.
+class_inference:
+  cmd/dirstat: entrypoint
+  internal/cli: wiring
+  internal/tui: presentation
+  internal/render: presentation
+  internal/scan: domain
+  internal/agg: domain
+  internal/index: domain
+  internal/scope: foundation
+  internal/format: foundation
+  internal/tree: foundation
+  internal/version: foundation
+
+# ownership_inference: logical ownership / team-ish grouping.
+ownership_inference:
+  cmd/dirstat: wiring
+  internal/cli: wiring
+  internal/tui: ui
+  internal/render: ui
+  internal/scan: engine
+  internal/agg: engine
+  internal/index: engine
+  internal/scope: infra
+  internal/format: infra
+  internal/tree: model
+  internal/version: infra

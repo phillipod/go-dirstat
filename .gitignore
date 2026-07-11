@@ -1,0 +1,30 @@
+# Binaries
+/dirstat
+/bin/
+/dist/
+*.exe
+*.test
+
+# Build artifacts
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+/vendor/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+*~
+
+# Axle artifacts
+.axle/
+.structural-cache/
+
+# Local agent workspaces (tooling, not project source)
+.agents/
+.claude/
+.codex/
