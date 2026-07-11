@@ -114,16 +114,30 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 		return nil, Stats{}, err
 	}
 	rootFSPath := rootAbs
-	if opts.Policy.FollowSymlinks && followedAliasMode(info.Mode()) {
-		info, err = os.Stat(rootAbs)
-		if err != nil {
-			return nil, Stats{}, err
+	if opts.Policy.FollowSymlinks {
+		alias := followedAliasMode(info.Mode())
+		if runtime.GOOS == windowsOS && !info.IsDir() {
+			// Junctions can be reported as non-directories without an alias mode
+			// bit. A followed Stat that changes the shape to a directory proves
+			// this is a directory reparse point rather than a regular file root.
+			if followed, statErr := os.Stat(rootAbs); statErr == nil && followed.IsDir() {
+				info = followed
+				alias = true
+			}
 		}
-		// Resolve the path for filesystem-type lookup. The tree keeps the
-		// user-supplied symlink name, while traversal and accounting use the
-		// target's metadata, just like followed symlinks below the root.
-		if resolved, resolveErr := filepath.EvalSymlinks(rootAbs); resolveErr == nil {
-			rootFSPath = resolved
+		if alias {
+			if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
+				info, err = os.Stat(rootAbs)
+				if err != nil {
+					return nil, Stats{}, err
+				}
+			}
+			// Resolve the path for filesystem-type lookup. The tree keeps the
+			// user-supplied symlink name, while traversal and accounting use the
+			// target's metadata, just like followed symlinks below the root.
+			if resolved, resolveErr := filepath.EvalSymlinks(rootAbs); resolveErr == nil {
+				rootFSPath = resolved
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -816,9 +830,9 @@ func (s *scanner) runStatTask(task statTask) {
 	if s.ctx.Err() != nil {
 		return
 	}
-	info, err := s.statEntry(task.parent, task.entry)
+	info, alias, err := s.statEntry(task.parent, task.entry)
 	resolved := ""
-	if err == nil && s.opts.Policy.FollowSymlinks && (runtime.GOOS == windowsOS || followedAliasEntry(task.entry)) {
+	if err == nil && s.opts.Policy.FollowSymlinks && alias {
 		resolved, _ = filepath.EvalSymlinks(filepath.Join(task.parent, task.entry.Name()))
 	}
 	if s.ctx.Err() != nil {
@@ -829,18 +843,41 @@ func (s *scanner) runStatTask(task statTask) {
 	}
 }
 
-// statEntry stats a single entry, following symlinks when configured. Windows
-// represents directory junctions as reparse points rather than ordinary
-// ModeSymlink entries, and some directory APIs omit that type bit entirely. A
-// follow-enabled Windows scan therefore asks os.Stat for every entry so a
-// junction is classified from its target and can be claimed by the existing
-// directory identity graph instead of leaking as a file leaf.
-func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, error) {
+// statEntry stats a single entry, following symlinks when configured. The
+// returned alias bit records whether the visible path was a link/reparse alias
+// so callers can resolve the target for boundary and identity checks without
+// canonicalizing ordinary Windows paths (which may change long/short spelling).
+func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, bool, error) {
 	p := filepath.Join(parent, e.Name())
-	if s.opts.Policy.FollowSymlinks && (runtime.GOOS == windowsOS || followedAliasEntry(e)) {
-		return os.Stat(p) // follow
+	if !s.opts.Policy.FollowSymlinks {
+		info, err := e.Info()
+		return info, false, err
 	}
-	return e.Info()
+	if runtime.GOOS != windowsOS {
+		alias := followedAliasEntry(e)
+		if alias {
+			info, err := os.Stat(p)
+			return info, true, err
+		}
+		info, err := e.Info()
+		return info, false, err
+	}
+
+	// Windows directory enumeration does not consistently expose mount-point
+	// reparse tags through DirEntry.Type. Lstat gives us the un-followed mode,
+	// while Stat supplies the target shape needed to classify junctions as
+	// directories. Keep the alias bit separate so regular files retain their
+	// lexical include-path spelling.
+	lstat, err := os.Lstat(p)
+	if err != nil {
+		return nil, false, err
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, false, err
+	}
+	alias := followedAliasMode(lstat.Mode()) || (!lstat.IsDir() && info.IsDir())
+	return info, alias, nil
 }
 
 func followedAliasEntry(e os.DirEntry) bool {
