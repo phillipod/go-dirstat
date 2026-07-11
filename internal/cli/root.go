@@ -11,6 +11,8 @@ import (
 	"github.com/phillipod/go-dirstat/internal/version"
 )
 
+const windowsOS = "windows"
+
 // New returns the root cobra command for dirstat. Flags are bound once here and
 // shared by the subcommands that need them via the persistent flag set.
 func New() *cobra.Command {

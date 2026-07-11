@@ -297,15 +297,18 @@ func TestApplyChainedCreateTruncateChmodAndRename(t *testing.T) {
 	renamed := filepath.Join(dir, "renamed")
 	size := int64(4096)
 	mode := uint32(0o640)
+	operations := []Operation{
+		{ID: "mkdir", Action: ActionMkdir, Source: dir},
+		{ID: "touch", Action: ActionTouch, Source: file},
+		{ID: "truncate", Action: ActionTruncate, Source: file, Size: &size},
+	}
+	if runtime.GOOS != windowsOS {
+		operations = append(operations, Operation{ID: "chmod", Action: ActionChmod, Source: file, Mode: &mode})
+	}
+	operations = append(operations, Operation{ID: "rename", Action: ActionRename, Source: file, Destination: renamed})
 	plan := Plan{
-		Header: PlanHeader{Version: PlanVersion, Root: root},
-		Operations: []Operation{
-			{ID: "mkdir", Action: ActionMkdir, Source: dir},
-			{ID: "touch", Action: ActionTouch, Source: file},
-			{ID: "truncate", Action: ActionTruncate, Source: file, Size: &size},
-			{ID: "chmod", Action: ActionChmod, Source: file, Mode: &mode},
-			{ID: "rename", Action: ActionRename, Source: file, Destination: renamed},
-		},
+		Header:     PlanHeader{Version: PlanVersion, Root: root},
+		Operations: operations,
 	}
 	results, err := Apply(context.Background(), plan, ApplyOptions{DisableAudit: true})
 	if err != nil || len(results) != len(plan.Operations) {

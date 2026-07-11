@@ -19,8 +19,6 @@ import (
 	querypkg "github.com/phillipod/go-dirstat/internal/query"
 )
 
-const windowsOS = "windows"
-
 func TestQueryTSVSelectableHumanAndRawFields(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "small.log"), []byte("abc"), 0o600); err != nil {

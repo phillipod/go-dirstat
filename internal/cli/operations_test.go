@@ -391,7 +391,7 @@ func executeOperationCLIError(t *testing.T, args ...string) error {
 
 func sameTestPath(left, right string) bool {
 	left, right = filepath.Clean(left), filepath.Clean(right)
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == windowsOS {
 		if resolved, err := canonicalTestPath(left); err == nil {
 			left = resolved
 		}

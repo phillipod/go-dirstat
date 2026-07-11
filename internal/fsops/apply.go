@@ -820,10 +820,11 @@ func within(root, path string) bool {
 
 func samePath(a, b string) bool {
 	a, b = filepath.Clean(a), filepath.Clean(b)
-	if runtime.GOOS == "darwin" {
-		// macOS exposes /var as a symlink to /private/var. Normalize existing
+	if runtime.GOOS == "darwin" || runtime.GOOS == windowsOS {
+		// macOS exposes /var as a symlink to /private/var, while Windows may
+		// alternate between short and long profile spellings. Normalize existing
 		// ancestors so guards and injected publication seams compare the same
-		// object even when callers use the conventional alias.
+		// object even when callers use an alias.
 		if resolved, err := canonicalNoFollowPath(a); err == nil {
 			a = resolved
 		}
@@ -1286,10 +1287,10 @@ func copyDirectoryIntoExisting(
 			return err
 		}
 	}
-	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
 		return err
 	}
-	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
 		return err
 	}
 	return syncDirectory(dst, filesystem)

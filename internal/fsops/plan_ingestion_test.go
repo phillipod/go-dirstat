@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -185,6 +186,9 @@ func TestApplyRejectsDuplicateIDsAndInvalidDependenciesBeforeMutation(t *testing
 
 	t.Run("stale guard after prior mutation", func(t *testing.T) {
 		t.Parallel()
+		if runtime.GOOS == windowsOS {
+			t.Skip("chmod is unsupported on Windows; the platform contract is covered by capability tests")
+		}
 		root := t.TempDir()
 		path := filepath.Join(root, "file")
 		if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {

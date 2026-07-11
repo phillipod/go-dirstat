@@ -55,7 +55,7 @@ func TestPlanRepeatedSourcesAreGuardedOrderedDeduplicatedAndSummarized(t *testin
 }
 
 func TestPlanFiles0FromPreservesHostileNames(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == windowsOS {
 		t.Skip("Windows does not accept every control character used by this filename fixture")
 	}
 	t.Parallel()

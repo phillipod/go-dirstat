@@ -393,7 +393,7 @@ func operationDeduplicationKey(operation fsops.Operation) (string, error) {
 }
 
 func sameOperationPath(left, right string) bool {
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == windowsOS {
 		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 	}
 	return filepath.Clean(left) == filepath.Clean(right)
