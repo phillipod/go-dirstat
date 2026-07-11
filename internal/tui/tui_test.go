@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -676,7 +677,7 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("target still exists: %v", err)
 	}
-	if info, err := os.Stat(auditPath); err != nil || info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(auditPath); err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit log missing or unsafe: info=%v err=%v", info, err)
 	}
 	if _, err := os.Stat(filepath.Join(path, ".dirstat-audit.jsonl")); !os.IsNotExist(err) {
