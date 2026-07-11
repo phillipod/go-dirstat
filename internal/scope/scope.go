@@ -274,8 +274,25 @@ func canonicalComparePath(path string) string {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
+	// EvalSymlinks requires the complete path to exist. Walk up to the deepest
+	// existing ancestor, resolve that prefix, and append any missing suffix so
+	// exclusions also protect paths that have not been created yet.
+	var suffix []string
+	probe := path
+	for {
+		if resolved, err := filepath.EvalSymlinks(probe); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			path = resolved
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
 	}
 	path = filepath.Clean(path)
 	if runtime.GOOS == "windows" {

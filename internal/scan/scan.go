@@ -126,26 +126,26 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 			fsName = "unknown"
 		}
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
-			"scan root %q is on filesystem %q, which is not allowed by the filesystem policy",
+			"scan root %s is on filesystem %q, which is not allowed by the filesystem policy",
 			rootDisplay,
 			fsName,
 		)
 	}
 	if !opts.Policy.AllowsPath(rootAbs) {
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
-			"scan root %q is not allowed by the path policy",
+			"scan root %s is not allowed by the path policy",
 			rootDisplay,
 		)
 	}
 	if rootFSPath != rootAbs && !opts.Policy.AllowsPath(rootFSPath) {
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
-			"scan root symlink target %q is not allowed by the path policy",
+			"scan root symlink target %s is not allowed by the path policy",
 			rootFSPath,
 		)
 	}
 	if !info.IsDir() && !opts.Policy.File(info.Size()) {
 		return nil, Stats{RootFS: rootFS}, fmt.Errorf(
-			"scan root file %q does not satisfy the size policy",
+			"scan root file %s does not satisfy the size policy",
 			rootDisplay,
 		)
 	}

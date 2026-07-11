@@ -3,6 +3,7 @@ package render
 import (
 	"fmt"
 	"io"
+	"path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -46,7 +47,7 @@ func (r *tsvRenderer) node(n *tree.Node, rel string, depth int) error {
 		children = children[:r.opts.Limit]
 	}
 	for _, child := range children {
-		if err := r.node(child, filepath.Join(rel, child.Name), depth+1); err != nil {
+		if err := r.node(child, path.Join(rel, child.Name), depth+1); err != nil {
 			return err
 		}
 	}
@@ -60,7 +61,7 @@ func qualifiedPath(root, rel string) string {
 	if root == "." {
 		return "./" + filepath.ToSlash(rel)
 	}
-	return filepath.ToSlash(filepath.Join(root, rel))
+	return path.Join(root, rel)
 }
 
 // escapeTSVPath makes arbitrary filesystem byte strings safe for a line-based
