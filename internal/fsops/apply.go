@@ -1253,10 +1253,25 @@ func copyDirectoryStaged(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Some native filesystems (notably macOS volumes) require the source
+	// directory being renamed to remain owner-writable even when the final
+	// destination is intentionally read-only. Make the private stage renameable
+	// first, publish it atomically, then restore the reviewed root mode.
+	sourceInfo, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	finalMode := sourceInfo.Mode().Perm()
+	if err := os.Chmod(stage, finalMode|0o200); err != nil {
+		return fmt.Errorf("prepare directory copy publication: %w", err)
+	}
 	if err := filesystem.publish(stage, dst); err != nil {
 		return fmt.Errorf("publish directory copy: %w", err)
 	}
 	published = true
+	if err := os.Chmod(dst, finalMode); err != nil {
+		return publishedMutation(fmt.Errorf("directory copy published but destination mode could not be restored: %w", err))
+	}
 	if err := syncDirectory(filepath.Dir(dst), filesystem); err != nil {
 		return publishedMutation(fmt.Errorf("directory copy published but parent sync failed: %w", err))
 	}
