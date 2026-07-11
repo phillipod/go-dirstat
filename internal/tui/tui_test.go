@@ -9,11 +9,13 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/phillipod/go-dirstat/internal/format"
+	"github.com/phillipod/go-dirstat/internal/fsinfo"
 	"github.com/phillipod/go-dirstat/internal/fsops"
 	"github.com/phillipod/go-dirstat/internal/scan"
 	"github.com/phillipod/go-dirstat/internal/scope"
@@ -638,6 +640,13 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 		}
 	}
 	target := m.selectedAbsolutePath()
+	targetNode := m.findNode(target)
+	if targetNode == nil {
+		t.Fatal("selected delete target is absent from the measured tree")
+	}
+	beforeApparent, beforeAlloc := m.root.Apparent, m.root.Alloc
+	beforeFiles := m.root.FileCount
+	m.stats.Files, m.stats.Dirs = beforeFiles, m.root.DirCount+1
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF8})
 	m = updated.(*model)
@@ -674,6 +683,31 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	if m.management != managementResult || len(m.queue) != 0 {
 		t.Fatalf("post-apply state management=%v queue=%d error=%q", m.management, len(m.queue), m.managementError)
 	}
+	if m.scanning {
+		t.Fatal("an exact file deletion unnecessarily started a rescan")
+	}
+	if m.findNode(target) != nil {
+		t.Fatal("deleted file remains in the measured tree")
+	}
+	if got, want := m.root.Apparent, beforeApparent-targetNode.Apparent; got != want {
+		t.Fatalf("root apparent bytes = %d, want %d", got, want)
+	}
+	if got, want := m.root.Alloc, beforeAlloc-targetNode.Alloc; got != want {
+		t.Fatalf("root allocated bytes = %d, want %d", got, want)
+	}
+	if m.root.FileCount != beforeFiles-1 || m.stats.Files != beforeFiles-1 {
+		t.Fatalf("file totals = tree:%d stats:%d, want %d", m.root.FileCount, m.stats.Files, beforeFiles-1)
+	}
+	for _, row := range m.topRows {
+		if row.file.Rel == "big.bin" {
+			t.Fatal("deleted file remains in the largest-files view")
+		}
+	}
+	for _, row := range m.extRows {
+		if row.ext.Ext == ".bin" {
+			t.Fatal("deleted file remains in the extension view")
+		}
+	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("target still exists: %v", err)
 	}
@@ -682,6 +716,56 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(path, ".dirstat-audit.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("TUI ignored configured audit path: %v", err)
+	}
+}
+
+func TestSuccessfulDirectoryDeleteUpdatesSubtreeMetadataWithoutRescan(t *testing.T) {
+	path, root := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: root})
+	m.stats.Files, m.stats.Dirs = m.root.FileCount, m.root.DirCount+1
+
+	target := filepath.Join(path, "sub")
+	entry, err := fsinfo.Inspect(target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := m.findNode(target)
+	if removed == nil {
+		t.Fatal("directory is absent from the measured tree")
+	}
+	beforeApparent, beforeAlloc := m.root.Apparent, m.root.Alloc
+	beforeFiles, beforeDirs := m.stats.Files, m.stats.Dirs
+	m.queue = []fsops.Operation{{ID: "delete-sub", Action: fsops.ActionDelete, Source: target, Expected: &entry, Recursive: true}}
+	m.management = managementApplying
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, cmd := m.Update(appliedMsg{results: []fsops.Result{{
+		OperationID: "delete-sub", Action: fsops.ActionDelete, Status: "ok", FinishedAt: time.Now(),
+	}}})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("metadata update did not request refreshed inspection")
+	}
+	if m.scanning {
+		t.Fatal("an exact directory deletion unnecessarily started a rescan")
+	}
+	if m.findNode(target) != nil {
+		t.Fatal("deleted directory remains in the measured tree")
+	}
+	if got, want := m.root.Apparent, beforeApparent-removed.Apparent; got != want {
+		t.Fatalf("root apparent bytes = %d, want %d", got, want)
+	}
+	if got, want := m.root.Alloc, beforeAlloc-removed.Alloc; got != want {
+		t.Fatalf("root allocated bytes = %d, want %d", got, want)
+	}
+	if got, want := m.stats.Files, beforeFiles-removed.FileCount; got != want {
+		t.Fatalf("files = %d, want %d", got, want)
+	}
+	if got, want := m.stats.Dirs, beforeDirs-removed.DirCount-1; got != want {
+		t.Fatalf("directories = %d, want %d", got, want)
 	}
 }
 
@@ -706,26 +790,45 @@ func TestF8MarksDirectoryDeleteRecursive(t *testing.T) {
 	}
 }
 
-func TestPartialApplyDropsCompletedOperationsAndRescans(t *testing.T) {
+func TestPartialApplyDropsCompletedOperationsAndUpdatesExactDeletes(t *testing.T) {
 	path, node := mkTree(t)
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
 	m = asModel(t, m, scanDoneMsg{node: node})
+	target := filepath.Join(path, "big.bin")
+	entry, err := fsinfo.Inspect(target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := m.root.Apparent
+	removed := m.findNode(target)
+	if removed == nil {
+		t.Fatal("delete target is absent from the measured tree")
+	}
 	m.queue = []fsops.Operation{
-		{ID: "done", Action: fsops.ActionDelete, Source: filepath.Join(path, "done")},
+		{ID: "done", Action: fsops.ActionDelete, Source: target, Expected: &entry},
 		{ID: "failed", Action: fsops.ActionDelete, Source: filepath.Join(path, "failed")},
 		{ID: "pending", Action: fsops.ActionDelete, Source: filepath.Join(path, "pending")},
 	}
 	m.management = managementApplying
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
 	updated, cmd := m.Update(appliedMsg{
 		results: []fsops.Result{
-			{OperationID: "done", Action: fsops.ActionDelete, Status: "ok"},
+			{OperationID: "done", Action: fsops.ActionDelete, Status: "ok", FinishedAt: time.Now()},
 			{OperationID: "failed", Action: fsops.ActionDelete, Status: "error", Error: "stale"},
 		},
 		err: errors.New("stale"),
 	})
 	m = updated.(*model)
-	if cmd == nil || !m.scanning {
-		t.Fatal("partial mutation did not start a rescan")
+	if cmd == nil {
+		t.Fatal("partial mutation did not refresh inspection")
+	}
+	if m.scanning {
+		t.Fatal("an exact successful delete in a partial apply unnecessarily started a rescan")
+	}
+	if m.findNode(target) != nil || m.root.Apparent != before-removed.Apparent {
+		t.Fatal("successful portion of partial apply was not reflected in the tree")
 	}
 	if len(m.queue) != 2 || m.queue[0].ID != "failed" || m.queue[1].ID != "pending" {
 		t.Fatalf("remaining queue = %#v", m.queue)
@@ -733,6 +836,21 @@ func TestPartialApplyDropsCompletedOperationsAndRescans(t *testing.T) {
 	if m.management != managementResult || !contains(m.managementError, "stale") {
 		t.Fatalf("management=%v error=%q", m.management, m.managementError)
 	}
+}
+
+func TestSuccessfulNonDeleteApplyStartsReconciliationScan(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	m.queue = []fsops.Operation{{ID: "copy", Action: fsops.ActionCopy, Source: filepath.Join(path, "a.go")}}
+	m.management = managementApplying
+
+	updated, cmd := m.Update(appliedMsg{results: []fsops.Result{{OperationID: "copy", Action: fsops.ActionCopy, Status: "ok"}}})
+	m = updated.(*model)
+	if cmd == nil || !m.scanning {
+		t.Fatal("a non-delete mutation did not start a reconciliation scan")
+	}
+	m.cancelScan()
 }
 
 func TestF5QueuesCopyDestinationWithoutMutation(t *testing.T) {

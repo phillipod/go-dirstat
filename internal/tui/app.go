@@ -100,10 +100,26 @@ func (m *model) startScan() tea.Cmd {
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.scanCancel = cancel
 	m.scanning = true
-	m.retainDuringScan = m.gotData
+	m.retainDuringScan = m.completeTree
 	m.scanNote = ""
 	m.scanErr = nil
 	return scanStreamCmd(m.app, m.program, ctx, m.scanGeneration)
+}
+
+// pauseScanForApply prevents a scan that straddles a filesystem mutation from
+// publishing a mixed before/after tree. The accepted deletion delta is still
+// applied immediately; a fresh generation reconciles it after apply returns.
+func (m *model) pauseScanForApply() {
+	m.applyNeedsScan = m.scanning
+	if !m.scanning {
+		return
+	}
+	m.cancelScan()
+	m.scanGeneration++
+	m.scanning = false
+	m.retainDuringScan = false
+	m.cacheNote = ""
+	m.scanNote = ""
 }
 
 // stopScan cancels the active generation while retaining the latest cached or

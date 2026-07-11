@@ -62,6 +62,7 @@ type model struct {
 
 	scanning         bool   // a background scan is in flight
 	gotData          bool   // a real (non-placeholder) tree has arrived
+	completeTree     bool   // root is a complete scan/cache tree, not a progress snapshot
 	retainDuringScan bool   // keep prior results visible until a refresh completes
 	cacheNote        string // e.g. "cached 3m ago, refreshing…" when shown from cache
 	scanNote         string // e.g. "scan stopped" after retaining partial results
@@ -92,6 +93,7 @@ type model struct {
 	queue            []fsops.Operation
 	applyResults     []fsops.Result
 	applyCancel      context.CancelFunc
+	applyNeedsScan   bool // applying interrupted a scan that must be restarted
 	nextOperation    uint64
 
 	inspectGeneration uint64
@@ -167,6 +169,7 @@ func (m *model) Init() tea.Cmd {
 				m.root = node
 				m.stats = scan.Stats{Files: snap.Files, Dirs: snap.Dirs, Errors: snap.Errors, RootFS: snap.RootFS}
 				m.gotData = true
+				m.completeTree = true
 				m.cacheNote = "cached " + format.Age(index.Age(snap)) + ", refreshing…"
 				m.rebuild()
 				return m.startScan()
@@ -240,7 +243,7 @@ func (m *model) selectedAbsolutePath() string {
 func (m *model) requestInspect() tea.Cmd {
 	path := m.selectedAbsolutePath()
 	if path == "" {
-		m.inspectPath, m.inspectPreview, m.inspectErr = "", nil, nil
+		m.inspectPath, m.inspectEntry, m.inspectPreview, m.inspectErr = "", fsinfo.Entry{}, nil, nil
 		return nil
 	}
 	m.inspectGeneration++

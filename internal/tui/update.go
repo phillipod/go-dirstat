@@ -34,6 +34,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.root = msg.node
 		m.stats = msg.stats
 		m.gotData = true
+		m.completeTree = false
 		m.scanning = true
 		m.scanNote = ""
 		m.scanErr = nil
@@ -61,6 +62,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.root = msg.node
 		m.stats = msg.stats
 		m.gotData = true
+		m.completeTree = true
 		m.scanErr = nil
 		m.rebuild()
 		m.cacheSaves.markSuccessful(msg.generation)
@@ -103,31 +105,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyCancel = nil
 		}
 		m.applyResults = msg.results
+		completed, changed, needsScan := m.applyCompletedOperations(msg.results)
+		needsScan = needsScan || m.applyNeedsScan || m.auditMutationNeedsReconciliation()
+		m.applyNeedsScan = false
+		if len(completed) > 0 {
+			remaining := m.queue[:0]
+			for _, op := range m.queue {
+				if !completed[op.ID] {
+					remaining = append(remaining, op)
+				}
+			}
+			m.queue, m.marks = remaining, make(map[string]bool)
+		}
 		if msg.err != nil {
-			completed := make(map[string]bool)
-			for _, result := range msg.results {
-				if result.Status == "ok" && !result.DryRun {
-					completed[result.OperationID] = true
-				}
-			}
-			if len(completed) > 0 {
-				remaining := m.queue[:0]
-				for _, op := range m.queue {
-					if !completed[op.ID] {
-						remaining = append(remaining, op)
-					}
-				}
-				m.queue, m.marks = remaining, make(map[string]bool)
-			}
 			m.management, m.managementError = managementResult, msg.err.Error()
-			if len(completed) > 0 {
-				return m, m.startScan()
-			}
-			return m, nil
+			return m, m.afterFilesystemMutation(changed, needsScan)
 		}
 		m.queue, m.marks = nil, make(map[string]bool)
 		m.management, m.managementError = managementResult, ""
-		return m, m.startScan()
+		return m, m.afterFilesystemMutation(changed, needsScan)
 
 	case externalDoneMsg:
 		if msg.err != nil {
@@ -390,6 +386,7 @@ func (m *model) handleManagementKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.managementError = "type APPLY exactly to continue"
 				return m, nil
 			}
+			m.pauseScanForApply()
 			m.management, m.managementError = managementApplying, ""
 			return m, m.applyCmd()
 		case managementResult:

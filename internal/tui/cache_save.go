@@ -8,11 +8,11 @@ import (
 // cacheSaveCoordinator orders cache writes without blocking the Bubble Tea
 // update loop. A scan is marked successful as soon as its completion is
 // accepted; background save commands then serialize here and discard any
-// generation superseded by a newer successful scan.
+// generation superseded by a newer successful complete tree (from either a
+// scan or an exact in-memory mutation).
 //
-// Merely starting, canceling, or failing a newer scan does not advance the
-// successful generation, so a pending save of the last good result remains
-// eligible.
+// Merely starting, canceling, or failing a newer scan does not advance that
+// generation, so a pending save of the last good result remains eligible.
 type cacheSaveCoordinator struct {
 	latestSuccessful atomic.Uint64
 	saveMu           sync.Mutex

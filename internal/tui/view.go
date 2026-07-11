@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/phillipod/go-dirstat/internal/format"
+	"github.com/phillipod/go-dirstat/internal/fsops"
 	"github.com/phillipod/go-dirstat/internal/tree"
 	"github.com/phillipod/go-dirstat/internal/version"
 )
@@ -162,9 +163,20 @@ func (m *model) managementBody() string {
 		lines = append(lines, badgeStyle.Render(fmt.Sprintf("Applying %d operation(s)…", len(m.queue))), "", dimStyle.Render("Each source is revalidated against its captured identity, size, and modification time."))
 	case managementResult:
 		if m.managementError == "" {
-			lines = append(lines, badgeStyle.Render(fmt.Sprintf("Applied %d operation(s). Rescanning…", len(m.applyResults))))
+			status := fmt.Sprintf("Applied %d operation(s). View updated.", successfulApplyCount(m.applyResults))
+			if m.scanning {
+				status = fmt.Sprintf("Applied %d operation(s). Reconciling…", successfulApplyCount(m.applyResults))
+			}
+			lines = append(lines, badgeStyle.Render(status))
 		} else {
 			lines = append(lines, errStyle.Render("Apply stopped: "+format.SafeText(m.managementError)))
+			if successfulApplyCount(m.applyResults) > 0 {
+				status := "Successful changes are reflected in the current view."
+				if m.scanning {
+					status = "Successful changes are reflected; reconciling in the background."
+				}
+				lines = append(lines, dimStyle.Render(status))
+			}
 		}
 		for _, result := range m.applyResults {
 			line := fmt.Sprintf("%-7s %-7s %s", result.Status, result.Action, result.OperationID)
@@ -184,6 +196,16 @@ func (m *model) managementBody() string {
 		lines[i] = truncate(lines[i], w)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func successfulApplyCount(results []fsops.Result) int {
+	count := 0
+	for _, result := range results {
+		if result.Status == "ok" && !result.DryRun {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *model) managementHelp() string {
