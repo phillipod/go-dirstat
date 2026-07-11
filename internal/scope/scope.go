@@ -8,6 +8,7 @@ package scope
 import (
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -266,6 +267,14 @@ func pathWithinCanonical(parent, child string) bool {
 	return pathWithinClean(canonicalComparePath(parent), canonicalComparePath(child))
 }
 
+// PathsIntersect reports whether either path is the same as, an ancestor of,
+// or a descendant of the other after applying the same best-effort alias
+// normalization used by exclusion matching. It intentionally handles missing
+// suffixes below a symlinked existing ancestor.
+func PathsIntersect(left, right string) bool {
+	return pathWithinCanonical(left, right) || pathWithinCanonical(right, left)
+}
+
 func pathWithinClean(parent, child string) bool {
 	rel, err := filepath.Rel(parent, child)
 	if err != nil || filepath.IsAbs(rel) {
@@ -331,13 +340,33 @@ func matchGlob(pattern, name string) bool {
 }
 
 func cleanPaths(ps []string) []string {
-	out := make([]string, 0, len(ps))
+	candidates := make([]string, 0, len(ps))
 	for _, s := range ps {
 		if s == "" {
 			continue
 		}
-		out = append(out, filepath.Clean(s))
+		candidates = append(candidates, filepath.Clean(s))
 	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if len(candidates[i]) == len(candidates[j]) {
+			return candidates[i] < candidates[j]
+		}
+		return len(candidates[i]) < len(candidates[j])
+	})
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		redundant := false
+		for _, parent := range out {
+			if pathWithinClean(parent, candidate) {
+				redundant = true
+				break
+			}
+		}
+		if !redundant {
+			out = append(out, candidate)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

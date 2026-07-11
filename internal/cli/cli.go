@@ -12,9 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
+	appconfig "github.com/phillipod/go-dirstat/internal/config"
+	"github.com/phillipod/go-dirstat/internal/index"
 	"github.com/phillipod/go-dirstat/internal/render"
 	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
@@ -56,8 +59,9 @@ type Config struct {
 	MaxSize       string
 
 	// Execution.
-	Jobs    int
-	NoCache bool
+	Jobs         int
+	NoCache      bool
+	AllowPartial bool
 }
 
 // maxJobs bounds the scanner's process-wide traversal and stat pools. Larger
@@ -110,17 +114,56 @@ func (c *Config) policy() (scope.Policy, error) {
 		return scope.Policy{}, fmt.Errorf("--min-size (%s) must not exceed --max-size (%s)", c.MinSize, c.MaxSize)
 	}
 
+	excludePaths := append([]string(nil), c.ExcludePath...)
+	statePaths := defaultStateExclusions()
+	excludePaths = append(excludePaths, statePaths...)
+
 	return scope.New(
 		scope.WithCrossDevice(c.CrossDevice),
 		scope.WithFollowSymlinks(c.Follow),
 		scope.WithExcludeVirtual(!c.NoVirtual),
 		scope.WithExcludeGlobs(c.Exclude),
-		scope.WithExcludePaths(c.ExcludePath),
+		scope.WithExcludePaths(excludePaths),
 		scope.WithIncludePaths(c.IncludePath),
 		scope.WithFilesystems(c.IncludeFS, c.ExcludeFS),
 		scope.WithHidden(!c.NoHidden),
 		scope.WithSizeThreshold(min, max),
 	), nil
+}
+
+// defaultStateExclusions keeps dirstat from measuring its own cache, durable
+// history, and audit state during broad scans. Both user-visible and resolved
+// paths are included so followed aliases cannot reintroduce them.
+func defaultStateExclusions() []string {
+	cacheDir, err := index.DefaultStoreDir()
+	paths := make([]string, 0, 4)
+	if err == nil {
+		paths = append(paths, filepath.Clean(cacheDir))
+	}
+	stateDir, err := appconfig.StateDir()
+	if err == nil {
+		paths = append(paths, filepath.Clean(stateDir))
+	}
+	for _, path := range append([]string(nil), paths...) {
+		if resolved := resolvedPath(path); resolved != path {
+			paths = append(paths, resolved)
+		}
+	}
+	sort.Strings(paths)
+	return compactStrings(paths)
+}
+
+func compactStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := values[:1]
+	for _, value := range values[1:] {
+		if value != result[len(result)-1] {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func (c *Config) validate() error {

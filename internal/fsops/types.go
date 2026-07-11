@@ -11,7 +11,29 @@ import (
 	"github.com/phillipod/go-dirstat/internal/fsinfo"
 )
 
-const PlanVersion = 1
+const (
+	MaxPlanBytes            int64 = 64 << 20
+	MaxPlanOperations             = 100_000
+	legacyPlanVersion             = 1
+	PlanVersion                   = 2
+	planRecordType                = "plan"
+	operationRecordType           = "operation"
+	resultRecordType              = "result"
+	objectKindDirectory           = "directory"
+	objectKindFile                = "file"
+	objectKindSymlink             = "symlink"
+	ResultStatusOK                = "ok"
+	ResultStatusError             = "error"
+	ResultStatusPartial           = "partial"
+	ResultStatusIntent            = "intent"
+	AuditPhaseIntent              = "intent"
+	AuditPhaseOutcome             = "outcome"
+	AuditStatusDisabled           = "disabled"
+	AuditStatusNotAttempted       = "not_attempted"
+	AuditStatusWritten            = "written"
+	AuditStatusDurable            = "durable"
+	AuditStatusFailed             = "failed"
+)
 
 type Action string
 
@@ -43,12 +65,31 @@ type Operation struct {
 	Source      string        `json:"source,omitempty"`
 	Destination string        `json:"destination,omitempty"`
 	Expected    *fsinfo.Entry `json:"expected,omitempty"`
-	Mode        *uint32       `json:"mode,omitempty"`
-	UID         *int          `json:"uid,omitempty"`
-	GID         *int          `json:"gid,omitempty"`
-	Size        *int64        `json:"size,omitempty"`
-	Format      string        `json:"format,omitempty"`
-	Recursive   bool          `json:"recursive,omitempty"`
+	// ExpectedDestination guards both reviewed absence and the identity of an
+	// existing overwrite target. It was added in plan version 2.
+	ExpectedDestination *fsinfo.PathExpectation `json:"expected_destination,omitempty"`
+	Mode                *uint32                 `json:"mode,omitempty"`
+	UID                 *int                    `json:"uid,omitempty"`
+	GID                 *int                    `json:"gid,omitempty"`
+	Size                *int64                  `json:"size,omitempty"`
+	Format              string                  `json:"format,omitempty"`
+	Recursive           bool                    `json:"recursive,omitempty"`
+}
+
+// OperationRequest is the unguarded, script-facing input used to construct a
+// plan. IDs and source/destination expectations are deliberately absent: the
+// planner assigns deterministic IDs and captures current guards only after the
+// complete request set has passed static validation.
+type OperationRequest struct {
+	Action      Action  `json:"action"`
+	Source      string  `json:"source"`
+	Destination string  `json:"destination,omitempty"`
+	Mode        *uint32 `json:"mode,omitempty"`
+	UID         *int    `json:"uid,omitempty"`
+	GID         *int    `json:"gid,omitempty"`
+	Size        *int64  `json:"size,omitempty"`
+	Format      string  `json:"format,omitempty"`
+	Recursive   bool    `json:"recursive,omitempty"`
 }
 
 type Plan struct {
@@ -57,15 +98,29 @@ type Plan struct {
 }
 
 type Result struct {
-	Type        string    `json:"type"`
-	Version     int       `json:"version"`
-	OperationID string    `json:"operation_id"`
-	Action      Action    `json:"action"`
-	Status      string    `json:"status"`
-	DryRun      bool      `json:"dry_run,omitempty"`
-	Error       string    `json:"error,omitempty"`
-	StartedAt   time.Time `json:"started_at"`
-	FinishedAt  time.Time `json:"finished_at"`
+	Type        string `json:"type"`
+	Version     int    `json:"version"`
+	OperationID string `json:"operation_id"`
+	Action      Action `json:"action"`
+	Status      string `json:"status"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	// MayHaveMutated is true for an explicit partial outcome: the operation
+	// published useful state but could not finish every postcondition.
+	MayHaveMutated bool `json:"may_have_mutated,omitempty"`
+	// MutationCompleted distinguishes a completed filesystem operation from a
+	// partial mutation when recording its outcome fails. A completed mutation
+	// can therefore have status=partial when audit durability is uncertain.
+	MutationCompleted bool `json:"mutation_completed,omitempty"`
+	// AuditIntentStatus describes the pre-mutation intent record. AuditStatus
+	// describes the post-operation outcome record.
+	AuditIntentStatus string `json:"audit_intent_status,omitempty"`
+	AuditStatus       string `json:"audit_status,omitempty"`
+	// AuditPhase is present in audit-log records. Apply's returned operation
+	// results omit it.
+	AuditPhase string    `json:"audit_phase,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
 }
 
 type ConflictPolicy string
@@ -84,12 +139,23 @@ type ApplyOptions struct {
 	// AllowUnguarded is intended only for plan construction preflight. Normal
 	// apply surfaces must require Expected metadata for every existing source.
 	AllowUnguarded bool
+	// filesystem is a narrow package-test seam for exercising cross-device
+	// publication, copying, cleanup, sync, and close failures without depending
+	// on real mounts.
+	filesystem *mutationFilesystem
+	// auditFactory is a package-test seam for write, sync, and close failures.
+	// Callers use Audit or AuditPath instead.
+	auditFactory func(string) (auditLog, error)
+}
+
+func supportedVersion(version int) bool {
+	return version == legacyPlanVersion || version == PlanVersion
 }
 
 func WritePlan(w io.Writer, plan Plan) error {
 	enc := json.NewEncoder(w)
 	h := plan.Header
-	h.Type = "plan"
+	h.Type = planRecordType
 	if h.Version == 0 {
 		h.Version = PlanVersion
 	}
@@ -97,7 +163,7 @@ func WritePlan(w io.Writer, plan Plan) error {
 		return fmt.Errorf("write plan header: %w", err)
 	}
 	for _, op := range plan.Operations {
-		op.Type = "operation"
+		op.Type = operationRecordType
 		if err := enc.Encode(op); err != nil {
 			return fmt.Errorf("write operation %q: %w", op.ID, err)
 		}
@@ -106,32 +172,11 @@ func WritePlan(w io.Writer, plan Plan) error {
 }
 
 func ReadPlan(r io.Reader) (Plan, error) {
-	dec := json.NewDecoder(r)
-	var p Plan
-	if err := dec.Decode(&p.Header); err != nil {
-		return Plan{}, fmt.Errorf("read plan header: %w", err)
-	}
-	if p.Header.Type != "plan" || p.Header.Version != PlanVersion {
-		return Plan{}, fmt.Errorf("unsupported plan header type=%q version=%d", p.Header.Type, p.Header.Version)
-	}
-	for {
-		var op Operation
-		if err := dec.Decode(&op); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return Plan{}, fmt.Errorf("read operation: %w", err)
-		}
-		if op.Type != "operation" {
-			return Plan{}, fmt.Errorf("unexpected plan record type %q", op.Type)
-		}
-		p.Operations = append(p.Operations, op)
-	}
-	return p, nil
+	return readPlanJSONL(r)
 }
 
 func WriteResult(w io.Writer, result Result) error {
-	result.Type = "result"
+	result.Type = resultRecordType
 	if result.Version == 0 {
 		result.Version = PlanVersion
 	}
@@ -158,7 +203,7 @@ func ReadResults(r io.Reader) ([]Result, error) {
 			}
 			return nil, fmt.Errorf("read result: %w", err)
 		}
-		if result.Type != "result" || result.Version != PlanVersion {
+		if result.Type != resultRecordType || !supportedVersion(result.Version) {
 			return nil, fmt.Errorf("unsupported result type=%q version=%d", result.Type, result.Version)
 		}
 		results = append(results, result)

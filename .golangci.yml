@@ -2,7 +2,9 @@ version: "2"
 
 run:
   timeout: 5m
-  tests: false
+  # Test and fuzz code protects the same parsers and mutation boundaries as
+  # production code, so it is held to the same lint policy.
+  tests: true
 
 issues:
   max-issues-per-linter: 0
@@ -73,6 +75,4 @@ linters:
       - path: ".*_pb\\.go"
         linters: ["*"]
       - path: ".*_grpc\\.pb\\.go"
-        linters: ["*"]
-      - path: "^internal/testmock/"
         linters: ["*"]

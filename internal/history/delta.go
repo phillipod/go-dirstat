@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/phillipod/go-dirstat/internal/index"
@@ -24,6 +25,7 @@ const (
 // shrinkage and removal have negative values.
 type Delta struct {
 	Path           string    `json:"path"`
+	Depth          int       `json:"depth"`
 	IsDir          bool      `json:"is_directory"`
 	Change         Change    `json:"change"`
 	BeforeApparent int64     `json:"before_apparent_bytes"`
@@ -34,6 +36,26 @@ type Delta struct {
 	AllocatedDelta int64     `json:"allocated_delta_bytes"`
 	BeforeModTime  time.Time `json:"before_modified_at,omitempty"`
 	AfterModTime   time.Time `json:"after_modified_at,omitempty"`
+}
+
+// DeltaKind selects file, directory, or all history changes.
+type DeltaKind string
+
+const (
+	DeltaKindAll       DeltaKind = "all"
+	DeltaKindFile      DeltaKind = "file"
+	DeltaKindDirectory DeltaKind = "directory"
+)
+
+// DeltaFilter controls operational history output without changing the
+// underlying snapshots. MaxDepth is relative to the scan root; -1 is
+// unlimited. LeafOnly suppresses every changed path that has a changed
+// descendant, avoiding simultaneous ancestor and descendant aggregates.
+type DeltaFilter struct {
+	Kind     DeltaKind
+	MaxDepth int
+	Limit    int
+	LeafOnly bool
 }
 
 type measuredNode struct {
@@ -78,6 +100,13 @@ func Compare(previous, current *index.Snapshot) ([]Delta, error) {
 	for path, node := range after {
 		deltas = append(deltas, makeDelta(path, measuredNode{}, node, ChangeNew))
 	}
+	for i := range deltas {
+		depth, err := relativeDepth(previous.Root, deltas[i].Path)
+		if err != nil {
+			return nil, err
+		}
+		deltas[i].Depth = depth
+	}
 	sort.Slice(deltas, func(i, j int) bool {
 		ai, aj := abs64(deltas[i].AllocatedDelta), abs64(deltas[j].AllocatedDelta)
 		if ai != aj {
@@ -86,6 +115,70 @@ func Compare(previous, current *index.Snapshot) ([]Delta, error) {
 		return deltas[i].Path < deltas[j].Path
 	})
 	return deltas, nil
+}
+
+// FilterDeltas applies kind, depth, leaf, and count controls while preserving
+// Compare's deterministic magnitude/path ordering.
+func FilterDeltas(deltas []Delta, root string, filter DeltaFilter) ([]Delta, error) {
+	if filter.Kind == "" {
+		filter.Kind = DeltaKindAll
+	}
+	if filter.Kind != DeltaKindAll && filter.Kind != DeltaKindFile && filter.Kind != DeltaKindDirectory {
+		return nil, fmt.Errorf("history: unsupported delta kind %q", filter.Kind)
+	}
+	if filter.MaxDepth < -1 {
+		return nil, errors.New("history: maximum depth must be -1 or greater")
+	}
+	if filter.Limit < 0 {
+		return nil, errors.New("history: limit cannot be negative")
+	}
+	nonLeaves := make(map[string]bool)
+	depths := make([]int, len(deltas))
+	for i := range deltas {
+		depth, err := relativeDepth(root, deltas[i].Path)
+		if err != nil {
+			return nil, err
+		}
+		depths[i] = depth
+		if depth > 0 {
+			for parent := filepath.Dir(filepath.Clean(deltas[i].Path)); ; parent = filepath.Dir(parent) {
+				nonLeaves[parent] = true
+				if parent == filepath.Clean(root) {
+					break
+				}
+			}
+		}
+	}
+	result := make([]Delta, 0, len(deltas))
+	for i, delta := range deltas {
+		if filter.MaxDepth >= 0 && depths[i] > filter.MaxDepth {
+			continue
+		}
+		if filter.LeafOnly && nonLeaves[filepath.Clean(delta.Path)] {
+			continue
+		}
+		if filter.Kind == DeltaKindFile && delta.IsDir || filter.Kind == DeltaKindDirectory && !delta.IsDir {
+			continue
+		}
+		delta.Depth = depths[i]
+		result = append(result, delta)
+		if filter.Limit > 0 && len(result) == filter.Limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func relativeDepth(root, path string) (int, error) {
+	root = filepath.Clean(root)
+	relative, err := filepath.Rel(root, filepath.Clean(path))
+	if err != nil || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return 0, fmt.Errorf("history: delta path %q escapes root %q", path, root)
+	}
+	if relative == "." {
+		return 0, nil
+	}
+	return len(strings.Split(relative, string(filepath.Separator))), nil
 }
 
 func flattenPaths(snap *index.Snapshot) (map[string]measuredNode, error) {

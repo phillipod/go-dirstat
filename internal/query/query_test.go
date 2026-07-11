@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -81,6 +82,26 @@ func TestBuildMetadataIsOnDemandAndOwnershipMatchesNamesOrIDs(t *testing.T) {
 	}
 }
 
+func TestBuildCanFollowMetadataForFollowedScanAliases(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true}
+	root.AddChild(&tree.Node{Name: "alias", Apparent: 7, Alloc: 8})
+	var followed bool
+	records, err := Build(root, t.TempDir(), Options{
+		Metadata: true, FollowMetadata: true,
+		Inspect: func(_ string, follow bool) (fsinfo.Entry, error) {
+			followed = follow
+			return fsinfo.Entry{Mode: 0o100600, ModeText: "-rw-------"}, nil
+		},
+		Filter: Filter{Kinds: []Kind{KindFile}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !followed || len(records) != 1 || records[0].ModeText != "-rw-------" {
+		t.Fatalf("followed metadata records = %#v, followed=%t", records, followed)
+	}
+}
+
 func TestBuildDefaultAndMultiKeySortingAreStable(t *testing.T) {
 	now := time.Now()
 	root := &tree.Node{Name: "root", IsDir: true}
@@ -106,6 +127,112 @@ func TestBuildDefaultAndMultiKeySortingAreStable(t *testing.T) {
 	}
 }
 
+func TestBuildLimitRetainsBestSortedRecords(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true, FileCount: 3}
+	root.AddChild(&tree.Node{Name: "small", Apparent: 1})
+	root.AddChild(&tree.Node{Name: "largest", Apparent: 30})
+	root.AddChild(&tree.Node{Name: "middle", Apparent: 20})
+	records, err := Build(root, t.TempDir(), Options{
+		Limit:  2,
+		Filter: Filter{Kinds: []Kind{KindFile}},
+		Sort:   []SortKey{{Field: SortApparent, Desc: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := relativePaths(records); !reflect.DeepEqual(got, []string{"largest", "middle"}) {
+		t.Fatalf("bounded sorted records = %v", got)
+	}
+}
+
+func TestStreamUsesTreeOrderHonorsLimitAndPropagatesVisitorError(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true, FileCount: 2}
+	root.AddChild(&tree.Node{Name: "b", Apparent: 1})
+	root.AddChild(&tree.Node{Name: "a", Apparent: 2})
+	var paths []string
+	err := Stream(root, t.TempDir(), Options{Limit: 1, Filter: Filter{Kinds: []Kind{KindFile}}}, func(record Record) error {
+		paths = append(paths, record.Relative)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(paths, []string{"b"}) {
+		t.Fatalf("streamed paths = %v, want deterministic tree order", paths)
+	}
+
+	want := errors.New("writer closed")
+	err = Stream(root, t.TempDir(), Options{}, func(Record) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("stream error = %v, want %v", err, want)
+	}
+	if err := Stream(root, t.TempDir(), Options{}, nil); err == nil {
+		t.Fatal("nil stream visitor was accepted")
+	}
+	if err := Stream(root, t.TempDir(), Options{Sort: []SortKey{{Field: SortPath}}}, func(Record) error { return nil }); err == nil {
+		t.Fatal("stream sort key was silently ignored")
+	}
+}
+
+func TestBuildAndStreamRejectNegativeLimit(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true}
+	if _, err := Build(root, t.TempDir(), Options{Limit: -1}); err == nil {
+		t.Fatal("Build accepted a negative limit")
+	}
+	if err := Stream(root, t.TempDir(), Options{Limit: -1}, func(Record) error { return nil }); err == nil {
+		t.Fatal("Stream accepted a negative limit")
+	}
+}
+
+func TestBuildAndStreamContextHonorCancellation(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true, FileCount: 2}
+	root.AddChild(&tree.Node{Name: "first"})
+	root.AddChild(&tree.Node{Name: "second"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := BuildContext(ctx, root, t.TempDir(), Options{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled BuildContext() error = %v, want context.Canceled", err)
+	}
+	if err := StreamContext(ctx, root, t.TempDir(), Options{}, func(Record) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled StreamContext() error = %v, want context.Canceled", err)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	visits := 0
+	err := StreamContext(ctx, root, t.TempDir(), Options{}, func(Record) error {
+		visits++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || visits != 1 {
+		t.Fatalf("canceled StreamContext() visits=%d error=%v, want one visit and context.Canceled", visits, err)
+	}
+}
+
+func TestBuildLimitMatchesStableUnlimitedPrefixWithTies(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true, FileCount: 6}
+	for _, name := range []string{"z-first", "a", "z-second", "b", "z-third", "c"} {
+		root.AddChild(&tree.Node{Name: name, Apparent: 10})
+	}
+	opts := Options{
+		Filter: Filter{Kinds: []Kind{KindFile}},
+		Sort:   []SortKey{{Field: SortApparent, Desc: true}},
+	}
+	all, err := Build(root, t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.Limit = 3
+	limited, err := Build(root, t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := relativePaths(limited), relativePaths(all[:3]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("bounded tied prefix = %v, want stable unlimited prefix %v", got, want)
+	}
+}
+
 func TestBuildSizeFilterCanUseAllocatedBytes(t *testing.T) {
 	root := &tree.Node{Name: "root", IsDir: true}
 	root.AddChild(&tree.Node{Name: "sparse", Apparent: 1000, Alloc: 0})
@@ -119,6 +246,18 @@ func TestBuildSizeFilterCanUseAllocatedBytes(t *testing.T) {
 	}
 	if got := relativePaths(records); !reflect.DeepEqual(got, []string{"allocated"}) {
 		t.Fatalf("allocated size filter = %v", got)
+	}
+}
+
+func TestBuildClassifiesLeadingDotfileWithoutExtension(t *testing.T) {
+	root := &tree.Node{Name: "root", IsDir: true}
+	root.AddChild(&tree.Node{Name: ".env", Apparent: 3, Alloc: 8})
+	records, err := Build(root, t.TempDir(), Options{Filter: Filter{Kinds: []Kind{KindFile}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Name != ".env" || records[0].Extension != "" {
+		t.Fatalf("dotfile record = %#v", records)
 	}
 }
 

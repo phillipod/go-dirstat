@@ -142,7 +142,7 @@ func TestCommandTSVIsStableAcrossMultipleRoots(t *testing.T) {
 	}
 	second := t.TempDir()
 	oddName := `tab\tline\nbreak`
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == windowsOS {
 		// Windows reserves both backslash and control characters in names; the
 		// renderer package separately covers escaping those bytes.
 		oddName = "tab-line-break"

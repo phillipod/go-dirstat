@@ -2,9 +2,13 @@ package index
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -12,6 +16,8 @@ import (
 	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
+
+const fingerprintTestRoot = "/some/path"
 
 func TestSnapshotRoundTripPreservesTotals(t *testing.T) {
 	root := t.TempDir()
@@ -25,7 +31,8 @@ func TestSnapshotRoundTripPreservesTotals(t *testing.T) {
 	}
 	fp := Fingerprint(root, scope.New())
 
-	snap := FromTree(node, fp, stats.RootFS, stats.Files, stats.Dirs, stats.Errors, time.Now())
+	snap := FromTree(node, fp, stats.RootFS, stats.Files, stats.Dirs, stats.Errors, stats.Complete, time.Now())
+	snap.Root = root
 	data, err := snap.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +54,7 @@ func TestSnapshotRoundTripPreservesTotals(t *testing.T) {
 }
 
 func TestFingerprintChangesWithOptions(t *testing.T) {
-	root := "/some/path"
+	root := fingerprintTestRoot
 	p1 := scope.New()
 	p2 := scope.New(scope.WithCrossDevice(true))
 	if Fingerprint(root, p1) == Fingerprint(root, p2) {
@@ -58,8 +65,104 @@ func TestFingerprintChangesWithOptions(t *testing.T) {
 	}
 }
 
+func TestFingerprintUsesFullDigestAndUnambiguousFields(t *testing.T) {
+	root := fingerprintTestRoot
+	oneValue := scope.New(scope.WithExcludeGlobs([]string{"a\ng b"}))
+	twoValues := scope.New(scope.WithExcludeGlobs([]string{"a", "b"}))
+
+	got := Fingerprint(root, oneValue)
+	if len(got) != sha256.Size*2 {
+		t.Fatalf("fingerprint length = %d, want %d", len(got), sha256.Size*2)
+	}
+	if got == Fingerprint(root, twoValues) {
+		t.Fatal("length-prefixed fingerprints collided for delimiter-shaped inputs")
+	}
+	if legacyFingerprintForTest(root, oneValue) != legacyFingerprintForTest(root, twoValues) {
+		t.Fatal("test corpus no longer reproduces the legacy delimiter collision")
+	}
+}
+
+func TestFingerprintCanonicalizesUnorderedPolicyValues(t *testing.T) {
+	p1 := scope.New(
+		scope.WithExcludeGlobs([]string{"*.tmp", "*.bak"}),
+		scope.WithFilesystems([]string{"ext4", "xfs"}, []string{"proc", "tmpfs"}),
+	)
+	p2 := scope.New(
+		scope.WithExcludeGlobs([]string{"*.bak", "*.tmp"}),
+		scope.WithFilesystems([]string{"xfs", "ext4"}, []string{"tmpfs", "proc"}),
+	)
+	if got, want := Fingerprint("/root", p1), Fingerprint("/root", p2); got != want {
+		t.Fatalf("equivalent unordered policies differ:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestFingerprintIgnoresDisjointOperationalPathsButKeepsAncestors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scan", "child")
+	base := scope.New(scope.WithExcludeVirtual(false))
+	disjoint := scope.New(scope.WithExcludeVirtual(false), scope.WithExcludePaths([]string{filepath.Join(filepath.Dir(filepath.Dir(root)), "state")}))
+	if got, want := Fingerprint(root, disjoint), Fingerprint(root, base); got != want {
+		t.Fatalf("disjoint state path changed fingerprint: got %q want %q", got, want)
+	}
+	ancestor := scope.New(scope.WithExcludeVirtual(false), scope.WithExcludePaths([]string{filepath.Dir(root)}))
+	if Fingerprint(root, ancestor) == Fingerprint(root, base) {
+		t.Fatal("ancestor exclusion was dropped from the fingerprint")
+	}
+}
+
+func TestFingerprintKeepsMissingPathBelowSymlinkAlias(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "real")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	plain := scope.New(scope.WithExcludeVirtual(false))
+	aliasPolicy := scope.New(scope.WithExcludeVirtual(false), scope.WithExcludePaths([]string{filepath.Join(alias, "not-created-yet")}))
+	if Fingerprint(root, aliasPolicy) == Fingerprint(root, plain) {
+		t.Fatal("missing exclusion suffix below a symlink alias was dropped from the fingerprint")
+	}
+}
+
+func TestFingerprintStableVector(t *testing.T) {
+	policy := scope.New(
+		scope.WithCrossDevice(true),
+		scope.WithFollowSymlinks(true),
+		scope.WithExcludeVirtual(false),
+		scope.WithHidden(false),
+		scope.WithSizeThreshold(17, 4096),
+		scope.WithExcludeGlobs([]string{"*.tmp", "line\nbreak"}),
+		scope.WithFilesystems([]string{"ext4", "xfs"}, []string{"proc", "tmpfs"}),
+	)
+	const want = "47cd3b673ab7591500fc54383a6fddf25b80e9e1ad5a341e535b8453488c2836"
+	if got := Fingerprint("fixture-root", policy); got != want {
+		t.Fatalf("Fingerprint() = %q, want stable vector %q", got, want)
+	}
+}
+
+func TestUnmarshalRejectsLegacyFingerprint(t *testing.T) {
+	root := fingerprintTestRoot
+	policy := scope.New(scope.WithExcludeGlobs([]string{"*.tmp"}))
+	legacy := legacyFingerprintForTest(root, policy)
+	current := Fingerprint(root, policy)
+	if legacy == current {
+		t.Fatal("legacy and current fingerprints unexpectedly match")
+	}
+
+	snap := FromTree(&tree.Node{Name: "x", IsDir: true}, legacy, "", 0, 1, 0, true, time.Now())
+	data, err := snap.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Unmarshal(data, current); !errors.Is(err, ErrIncompatible) {
+		t.Fatalf("Unmarshal() error = %v, want ErrIncompatible", err)
+	}
+}
+
 func TestUnmarshalRejectsWrongFingerprint(t *testing.T) {
-	snap := FromTree(&tree.Node{Name: "x"}, "aaaa", "", 0, 0, 0, time.Now())
+	snap := FromTree(&tree.Node{Name: "x", IsDir: true}, "aaaa", "", 0, 1, 0, true, time.Now())
 	data, err := snap.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -152,4 +255,35 @@ func write(t *testing.T, path string, size int) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// legacyFingerprintForTest preserves the pre-v2 delimiter-based encoding so
+// the intentional cache invalidation remains an executable compatibility test.
+func legacyFingerprintForTest(root string, p scope.Policy) string {
+	h := sha256.New()
+	_, _ = fmt.Fprintln(h, root)
+	_, _ = fmt.Fprintln(h, p.CrossDevice, p.FollowSymlinks, p.ExcludeVirtual, p.IncludeHidden)
+	_, _ = fmt.Fprintln(h, p.MinSize, p.MaxSize)
+	writeSorted := func(tag string, values []string) {
+		values = append([]string(nil), values...)
+		sort.Strings(values)
+		for _, value := range values {
+			_, _ = fmt.Fprintln(h, tag, value)
+		}
+	}
+	writeKeys := func(tag string, values map[string]bool) {
+		keys := make([]string, 0, len(values))
+		for key := range values {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		writeSorted(tag, keys)
+	}
+	writeSorted("g", p.ExcludeGlobs)
+	writeSorted("ep", p.ExcludePaths)
+	writeSorted("ip", p.IncludePaths)
+	writeSorted("vp", p.VirtualPaths)
+	writeKeys("ifs", p.IncludeFS)
+	writeKeys("efs", p.ExcludeFS)
+	return hex.EncodeToString(h.Sum(nil)[:8])
 }

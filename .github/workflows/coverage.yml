@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Keep the oldest-supported lane honest despite the newer toolchain directive.
+  GOTOOLCHAIN: local
+
 concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: true
@@ -26,14 +30,14 @@ jobs:
       fail-fast: false
       matrix:
         go-version:
-          - '1.24.x'
-          - stable
+          - '1.25.12'
+          - '1.26.5'
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go ${{ matrix.go-version }}
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
@@ -42,14 +46,59 @@ jobs:
         run: go mod verify
 
       - name: Collect coverage
-        run: go test -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+        run: go test -covermode=atomic -coverpkg=./... -coverprofile="$RUNNER_TEMP/coverage.out" ./...
+
+      - name: Enforce critical TUI coverage ratchet
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -covermode=atomic -coverprofile="$RUNNER_TEMP/tui-coverage.out" ./internal/tui
+          go tool cover -func="$RUNNER_TEMP/tui-coverage.out" | tee tui-coverage.txt
+          tui_total="$(awk '$1 == "total:" { gsub("%", "", $3); print $3 }' tui-coverage.txt)"
+          printf '%s\n' "$tui_total" > tui-coverage-total.txt
+          awk -v total="$tui_total" 'BEGIN { if (total < 77) { printf "TUI coverage %.1f%% is below the 77%% critical-package floor\n", total; exit 1 } }'
+          awk '
+            BEGIN {
+              minimum["Run"] = 85; file["Run"] = "app.go"
+              minimum["Init"] = 75; file["Init"] = "model.go"
+              minimum["filterTreeRows"] = 85; file["filterTreeRows"] = "flatten.go"
+              minimum["managementBody"] = 75; file["managementBody"] = "view.go"
+              minimum["contextBody"] = 85; file["contextBody"] = "view.go"
+            }
+            {
+              name = $2
+              if (name in minimum && index($1, "/internal/tui/" file[name] ":") > 0) {
+                value = $3
+                gsub("%", "", value)
+                seen[name] = value + 0
+              }
+            }
+            END {
+              failed = 0
+              for (name in minimum) {
+                if (!(name in seen)) {
+                  printf "critical TUI surface %s was absent from coverage output\n", name
+                  failed = 1
+                } else if (seen[name] < minimum[name]) {
+                  printf "critical TUI surface %s coverage %.1f%% is below %.1f%%\n", name, seen[name], minimum[name]
+                  failed = 1
+                }
+              }
+              exit failed
+            }
+          ' tui-coverage.txt
+          {
+            echo "### Critical TUI coverage (${{ matrix.go-version }})"
+            echo
+            echo "Package statement coverage: **${tui_total}%** (77% floor)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Render coverage reports
         shell: bash
         run: |
           set -euo pipefail
-          go tool cover -func=coverage.out | tee coverage.txt
-          go tool cover -html=coverage.out -o coverage.html
+          go tool cover -func="$RUNNER_TEMP/coverage.out" | tee coverage.txt
+          go tool cover -html="$RUNNER_TEMP/coverage.out" -o coverage.html
           total="$(awk '$1 == "total:" { gsub("%", "", $3); print $3 }' coverage.txt)"
           printf '%s\n' "$total" > coverage-total.txt
           awk -v total="$total" 'BEGIN { if (total < 70) { printf "coverage %.1f%% is below the 70%% floor\n", total; exit 1 } }'
@@ -62,13 +111,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage reports
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ matrix.go-version }}
           path: |
-            coverage.out
+            ${{ runner.temp }}/coverage.out
             coverage.txt
             coverage.html
             coverage-total.txt
+            ${{ runner.temp }}/tui-coverage.out
+            tui-coverage.txt
+            tui-coverage-total.txt
           if-no-files-found: error
           retention-days: 14

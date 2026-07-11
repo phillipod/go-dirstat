@@ -41,8 +41,40 @@ func (m *model) rebuild() {
 	}
 	m.extRows = buildExtRows(m.root, m.sizeMode, m.extSort)
 	m.topRows = buildTopRows(m.root, m.sizeMode, largestFilesLimit)
+	if m.filter != "" {
+		m.extRows = filterExtRows(m.extRows, m.filter)
+		m.topRows = filterTopRows(m.topRows, m.filter)
+	}
 	m.restoreSelection()
 	m.clampOffset()
+}
+
+func filterExtRows(rows []extRow, query string) []extRow {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return rows
+	}
+	out := make([]extRow, 0, len(rows))
+	for _, row := range rows {
+		if strings.Contains(strings.ToLower(row.ext.Ext), query) {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func filterTopRows(rows []topRow, query string) []topRow {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return rows
+	}
+	out := make([]topRow, 0, len(rows))
+	for _, row := range rows {
+		if strings.Contains(strings.ToLower(row.file.Rel), query) {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func filterTreeRows(rows []row, query string) []row {
@@ -178,6 +210,8 @@ func (m *model) rememberSelection() {
 		if r := m.currentRow(); r != nil {
 			m.selectedPath = r.node.Path()
 		}
+	case viewGrowth, viewOpenDeleted:
+		// Analytical rows are immutable value records and retain cursor position.
 	}
 }
 
@@ -189,6 +223,8 @@ func (m *model) restoreSelection() {
 		m.restoreFileSelection()
 	case viewTree, viewHelp:
 		m.restoreTreeSelection()
+	case viewGrowth, viewOpenDeleted:
+		// Analytical rows do not have a browser identity to restore.
 	}
 }
 

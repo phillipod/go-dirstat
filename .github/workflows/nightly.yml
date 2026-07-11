@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Keep the version matrix honest despite the newer toolchain directive.
+  GOTOOLCHAIN: local
+
 concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: false
@@ -21,35 +25,39 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            go-version: '1.24.x'
+            go-version: '1.25.12'
             exe: ''
-            symlinks: true
+            link-mode: unix
           - os: ubuntu-latest
-            go-version: stable
+            go-version: '1.26.5'
             exe: ''
-            symlinks: true
+            link-mode: unix
           - os: ubuntu-24.04-arm
-            go-version: '1.24.x'
+            go-version: '1.25.12'
             exe: ''
-            symlinks: true
+            link-mode: unix
           - os: macos-latest
-            go-version: '1.24.x'
+            go-version: '1.25.12'
             exe: ''
-            symlinks: true
+            link-mode: unix
+          - os: macos-15-intel
+            go-version: '1.25.12'
+            exe: ''
+            link-mode: unix
           - os: windows-latest
-            go-version: '1.24.x'
+            go-version: '1.25.12'
             exe: .exe
-            symlinks: false
+            link-mode: windows
           - os: windows-11-arm
-            go-version: '1.24.x'
+            go-version: '1.25.12'
             exe: .exe
-            symlinks: false
+            link-mode: windows
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go ${{ matrix.go-version }}
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
@@ -70,61 +78,81 @@ jobs:
         shell: bash
         env:
           DIRSTAT: ./dirstat${{ matrix.exe }}
+          NIGHTLY_ARTIFACT_DIR: ${{ runner.temp }}/dirstat-nightly-artifacts
+        run: bash .github/scripts/nightly-cli-integration.sh
+
+      - name: Prove Unix symlink-loop and hardlink identity
+        if: matrix.link-mode == 'unix'
+        shell: bash
+        env:
+          DIRSTAT: ./dirstat${{ matrix.exe }}
         run: |
           set -euo pipefail
-          fixture="$(mktemp -d)"
-          trap 'rm -rf "$fixture"' EXIT
-          mkdir -p "$fixture/sub"
-          printf 'alpha\n' > "$fixture/alpha.txt"
-          printf 'beta payload\n' > "$fixture/sub/payload.bin"
-
-          "$DIRSTAT" --apparent --format=tsv --bytes --files "$fixture" > "$fixture/tree.tsv"
-          awk -F '\t' 'NF != 2 || $1 !~ /^[0-9]+$/ { exit 1 } END { if (NR < 4) exit 1 }' "$fixture/tree.tsv"
-
-          "$DIRSTAT" extensions --apparent --bytes --no-color --no-bar "$fixture" > "$fixture/extensions.txt"
-          grep -q '^By extension$' "$fixture/extensions.txt"
-          grep -q '^Largest files$' "$fixture/extensions.txt"
-
-          "$DIRSTAT" status --format=json "$fixture" > "$fixture/status.jsonl"
-          grep -q '"total_bytes"' "$fixture/status.jsonl"
-
-          "$DIRSTAT" query --apparent --kind=file --format=tsv \
-            --fields=size,path --sort=size:desc "$fixture" > "$fixture/query.tsv"
-          awk -F '\t' 'NF != 2 || $1 !~ /^[0-9]+$/ { exit 1 } END { if (NR < 2) exit 1 }' "$fixture/query.tsv"
-
-          "$DIRSTAT" inspect --format=json --content --limit=16 "$fixture/alpha.txt" > "$fixture/inspect.json"
-          grep -q '"preview"' "$fixture/inspect.json"
-
-          "$DIRSTAT" history --store "$fixture/history" growth --format=json "$fixture" > "$fixture/history-baseline.json"
-          "$DIRSTAT" history --store "$fixture/history" growth --format=json "$fixture" > "$fixture/history-growth.json"
-          grep -q '"baseline":false' "$fixture/history-growth.json"
-
-          "$DIRSTAT" plan --root "$fixture" --output "$fixture/touch.plan.jsonl" touch generated.txt
-          "$DIRSTAT" apply --dry-run --no-audit "$fixture/touch.plan.jsonl" > "$fixture/dry-run.jsonl"
-          test ! -e "$fixture/generated.txt"
-          "$DIRSTAT" apply --yes --no-audit "$fixture/touch.plan.jsonl" > "$fixture/applied.jsonl"
-          test -f "$fixture/generated.txt"
-
-          if [[ "${{ matrix.symlinks }}" == "true" ]]; then
-            ln -s "$fixture" "$fixture/sub/root-loop"
-            "$DIRSTAT" --follow --apparent --format=tsv --bytes --files "$fixture" > "$fixture/follow.tsv"
-            if grep -Fq 'root-loop' "$fixture/follow.tsv"; then
-              echo 'followed root symlink loop was traversed' >&2
-              exit 1
-            fi
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          subject="$work/subject"
+          mkdir -p "$subject/sub"
+          printf 'seventeen-bytes!!' > "$subject/original.bin"
+          ln "$subject/original.bin" "$subject/hardlink.bin"
+          ln -s "$subject" "$subject/sub/root-loop"
+          "$DIRSTAT" --follow --apparent --format=tsv --bytes --files --sort=name "$subject" > "$work/follow.tsv"
+          test "$(awk -F '\t' 'NR == 1 { print $1 }' "$work/follow.tsv")" = 17
+          test "$(awk -F '\t' '$2 ~ /(original|hardlink)\.bin$/ { sum += $1; count++ } END { print sum ":" count }' "$work/follow.tsv")" = '17:2'
+          if grep -Fq 'root-loop' "$work/follow.tsv"; then
+            echo 'followed root symlink loop was traversed' >&2
+            exit 1
           fi
+
+      - name: Prove Windows junction-loop and hardlink identity
+        if: matrix.link-mode == 'windows'
+        shell: pwsh
+        env:
+          DIRSTAT: ${{ github.workspace }}/dirstat${{ matrix.exe }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'dirstat-windows-links'
+          $subject = Join-Path $work 'subject'
+          $output = Join-Path $work 'follow.tsv'
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path (Join-Path $subject 'sub') -Force | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $subject 'original.bin'), [Text.Encoding]::ASCII.GetBytes('seventeen-bytes!!'))
+          try {
+            New-Item -ItemType HardLink -Path (Join-Path $subject 'hardlink.bin') -Target (Join-Path $subject 'original.bin') | Out-Null
+            New-Item -ItemType Junction -Path (Join-Path $subject 'sub/root-loop') -Target $subject | Out-Null
+          } catch {
+            "Windows junction/hardlink capability: unavailable on $env:RUNNER_NAME - $_" >> $env:GITHUB_STEP_SUMMARY
+            throw
+          }
+          & $env:DIRSTAT --follow --apparent --format=tsv --bytes --files --sort=name $subject | Set-Content -Encoding utf8NoBOM $output
+          if ($LASTEXITCODE -ne 0) { throw "dirstat exited $LASTEXITCODE" }
+          $rows = Get-Content $output | ForEach-Object { ,($_ -split "`t", 2) }
+          if ([int64]$rows[0][0] -ne 17) { throw "root apparent bytes were $($rows[0][0]), want 17" }
+          $links = @($rows | Where-Object { $_[1] -match '(original|hardlink)\.bin$' })
+          $linkBytes = ($links | Measure-Object { [int64]$_[0] } -Sum).Sum
+          if ($links.Count -ne 2 -or $linkBytes -ne 17) { throw "hardlink identity proof failed: $($links | Out-String)" }
+          if (Select-String -Quiet -SimpleMatch 'root-loop' $output) { throw 'followed junction loop was traversed' }
+          "Windows junction and hardlink capability: available and verified on $env:RUNNER_NAME" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload exact fixture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-fixture-${{ matrix.os }}-go${{ matrix.go-version }}
+          path: ${{ runner.temp }}/dirstat-nightly-artifacts
+          if-no-files-found: error
+          retention-days: 14
 
   race:
     name: nightly race detector
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Set up stable Go
-        uses: actions/setup-go@v6
+      - name: Set up release Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: stable
+          go-version: '1.26.5'
           cache: true
 
       - name: Verify modules
@@ -132,3 +160,179 @@ jobs:
 
       - name: Run shuffled race-enabled tests
         run: go test -race -shuffle=on ./... -count=1
+
+  parser-fuzz:
+    name: bounded parser fuzzing / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: plan
+            package: ./internal/fsops
+            fuzz: FuzzReadPlan
+          - target: archive
+            package: ./internal/fsops
+            fuzz: FuzzArchiveValidation
+          - target: snapshot
+            package: ./internal/index
+            fuzz: FuzzSnapshotUnmarshal
+          - target: config
+            package: ./internal/config
+            fuzz: FuzzConfigDocument
+          - target: query
+            package: ./internal/query
+            fuzz: FuzzQueryFilter
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up release Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run bounded fuzz target
+        run: go test ${{ matrix.package }} -run '^$' -fuzz '^${{ matrix.fuzz }}$' -fuzztime=30s
+
+      - name: Retain fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: '**/testdata/fuzz/${{ matrix.fuzz }}/**'
+          if-no-files-found: ignore
+          retention-days: 30
+
+  query-performance-budget:
+    name: million-entry query performance budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up release Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run one-iteration million-entry benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/query -run '^$' \
+            -bench '^BenchmarkMillionEntryQuery/(bounded-top-100|unsorted-stream)$' \
+            -benchmem -benchtime=1x -count=1 | tee "$RUNNER_TEMP/query-benchmark.txt"
+
+      - name: Enforce deliberately non-flaky ceilings
+        shell: bash
+        run: |
+          awk '
+            /^BenchmarkMillionEntryQuery\/bounded-top-100-/ {
+              seen_top = 1
+              if ($3 > 20000000000 || $5 > 67108864) {
+                printf "bounded-top-100 exceeded budget: %s ns/op, %s B/op\n", $3, $5
+                failed = 1
+              }
+            }
+            /^BenchmarkMillionEntryQuery\/unsorted-stream-/ {
+              seen_stream = 1
+              if ($3 > 5000000000 || $5 > 67108864) {
+                printf "unsorted-stream exceeded budget: %s ns/op, %s B/op\n", $3, $5
+                failed = 1
+              }
+            }
+            END {
+              if (!seen_top || !seen_stream) {
+                print "required million-entry benchmark result was missing"
+                failed = 1
+              }
+              exit failed
+            }
+          ' "$RUNNER_TEMP/query-benchmark.txt"
+
+      - name: Retain benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: query-million-entry-benchmark
+          path: ${{ runner.temp }}/query-benchmark.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  wide-directory-performance-budget:
+    name: million-entry wide-directory memory budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up release Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run one-iteration million-entry scan benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/scan -run '^$' \
+            -bench '^BenchmarkMillionEntryWideDirectory/batched-4096$' \
+            -benchmem -benchtime=1x -count=1 | tee "$RUNNER_TEMP/wide-directory-benchmark.txt"
+
+      - name: Enforce throughput and peak-memory ceilings
+        shell: bash
+        run: |
+          # Local 1M evidence was 249-271 MB peak and 80-102 MB transient,
+          # versus 394-403 MB and 225-234 MB for a
+          # single unbounded batch. These ceilings retain material headroom.
+          awk '
+            /^BenchmarkMillionEntryWideDirectory\/batched-4096-/ {
+              seen = 1
+              for (i = 2; i < NF; i++) {
+                if ($(i + 1) == "entries/s") throughput = $i
+                if ($(i + 1) == "peak-heap-bytes/op") peak = $i
+                if ($(i + 1) == "retained-heap-bytes/op") retained = $i
+                if ($(i + 1) == "transient-heap-bytes/op") transient = $i
+              }
+            }
+            END {
+              if (!seen || !throughput || !peak || !retained || !transient) {
+                print "required wide-directory benchmark metrics were missing"
+                exit 1
+              }
+              failed = 0
+              if (throughput < 25000) {
+                printf "wide-directory throughput %.0f entries/s is below 25000\n", throughput
+                failed = 1
+              }
+              if (peak > 356515840) {
+                printf "wide-directory peak heap %.0f bytes exceeds 340 MiB\n", peak
+                failed = 1
+              }
+              if (retained > 230686720) {
+                printf "wide-directory retained heap %.0f bytes exceeds 220 MiB\n", retained
+                failed = 1
+              }
+              if (transient > 188743680) {
+                printf "wide-directory transient heap %.0f bytes exceeds 180 MiB\n", transient
+                failed = 1
+              }
+              exit failed
+            }
+          ' "$RUNNER_TEMP/wide-directory-benchmark.txt"
+
+      - name: Retain wide-directory benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scan-million-entry-wide-directory
+          path: ${{ runner.temp }}/wide-directory-benchmark.txt
+          if-no-files-found: error
+          retention-days: 30

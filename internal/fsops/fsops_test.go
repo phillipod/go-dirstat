@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,7 +33,7 @@ func TestPlanJSONLRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Header.Type != "plan" || len(got.Operations) != 1 || got.Operations[0].Type != "operation" {
+	if got.Header.Type != planRecordType || len(got.Operations) != 1 || got.Operations[0].Type != operationRecordType {
 		t.Fatalf("unexpected plan: %#v", got)
 	}
 }
@@ -164,11 +163,11 @@ func TestOverwriteRestoresDestinationWhenReplacementFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := errors.New("replacement failed")
-	if err := withDestination(destination, ConflictOverwrite, func() error {
+	if err := withDestinationGuarded(destination, ConflictOverwrite, nil, defaultMutationFilesystem(), func() error {
 		if err := os.WriteFile(destination, []byte("partial"), 0o600); err != nil {
 			return err
 		}
-		return want
+		return ownedDestinationMutation(want)
 	}); !errors.Is(err, want) {
 		t.Fatalf("error = %v", err)
 	}
@@ -211,6 +210,29 @@ func TestOpenAuditRejectsSymlink(t *testing.T) {
 	data, _ := os.ReadFile(target)
 	if string(data) != "keep" {
 		t.Fatalf("audit target changed to %q", data)
+	}
+}
+
+func TestOpenAuditCreatesPrivateParentDirectory(t *testing.T) {
+	t.Parallel()
+	parent := filepath.Join(t.TempDir(), "state", "dirstat")
+	path := filepath.Join(parent, "operations.jsonl")
+	f, err := OpenAudit(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("audit parent mode = %v", info.Mode())
+	}
+	if runtime.GOOS != windowsOS && info.Mode().Perm() != 0o700 {
+		t.Fatalf("audit parent permissions = %o", info.Mode().Perm())
 	}
 }
 
@@ -290,7 +312,7 @@ func TestApplyChainedCreateTruncateChmodAndRename(t *testing.T) {
 		t.Fatalf("results=%#v err=%v", results, err)
 	}
 	info, err := os.Stat(renamed)
-	if err != nil || info.Size() != size || runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
+	if err != nil || info.Size() != size || runtime.GOOS != windowsOS && info.Mode().Perm() != 0o640 {
 		t.Fatalf("renamed info=%v err=%v", info, err)
 	}
 }
@@ -313,7 +335,7 @@ func TestDryRunPerformsConflictAndArchivePreflight(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("not a tar"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan = testPlan(root, Operation{ID: "extract", Action: ActionExtract, Source: bad, Destination: filepath.Join(root, "out"), Format: "tar"})
+	plan = testPlan(root, Operation{ID: "extract", Action: ActionExtract, Source: bad, Destination: filepath.Join(root, "out"), Format: archiveFormatTar})
 	if _, err := Apply(context.Background(), plan, ApplyOptions{DryRun: true, DisableAudit: true}); err == nil {
 		t.Fatal("dry-run accepted corrupt archive")
 	}
@@ -355,33 +377,44 @@ func TestApplyDryRunAndDefaultAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != windowsOS && info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit mode = %o", info.Mode().Perm())
 	}
 	data, err := os.ReadFile(audit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var result Result
-	if err := json.Unmarshal(bytes.TrimSpace(data), &result); err != nil {
+	auditRecords, err := ReadResults(bytes.NewReader(data))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Type != "result" || result.Version != PlanVersion {
-		t.Fatalf("unexpected audit: %#v", result)
+	if len(auditRecords) != 2 || auditRecords[0].AuditPhase != AuditPhaseIntent ||
+		auditRecords[1].AuditPhase != AuditPhaseOutcome || auditRecords[1].Version != PlanVersion {
+		t.Fatalf("unexpected audit: %#v", auditRecords)
 	}
 }
 
 func TestArchiveExtractRoundTrip(t *testing.T) {
 	t.Parallel()
+	assertArchiveExtractRoundTrip(t, "data.tar.gz", "payload")
+}
+
+func TestZipArchiveExtractRoundTrip(t *testing.T) {
+	t.Parallel()
+	assertArchiveExtractRoundTrip(t, "data.zip", "zip payload")
+}
+
+func assertArchiveExtractRoundTrip(t *testing.T, archiveName, payload string) {
+	t.Helper()
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	if err := os.Mkdir(source, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(source, "file"), []byte("payload"), 0o640); err != nil {
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte(payload), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	archive, extracted := filepath.Join(root, "data.tar.gz"), filepath.Join(root, "out")
+	archive, extracted := filepath.Join(root, archiveName), filepath.Join(root, "out")
 	plan := testPlan(root,
 		Operation{ID: "archive", Action: ActionArchive, Source: source, Destination: archive},
 		Operation{ID: "extract", Action: ActionExtract, Source: archive, Destination: extracted},
@@ -393,31 +426,7 @@ func TestArchiveExtractRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "payload" {
-		t.Fatalf("got %q", data)
-	}
-}
-
-func TestZipArchiveExtractRoundTrip(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	source := filepath.Join(root, "source")
-	if err := os.Mkdir(source, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(source, "file"), []byte("zip payload"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	archive, extracted := filepath.Join(root, "data.zip"), filepath.Join(root, "out")
-	plan := testPlan(root, Operation{ID: "archive", Action: ActionArchive, Source: source, Destination: archive}, Operation{ID: "extract", Action: ActionExtract, Source: archive, Destination: extracted})
-	if _, err := Apply(context.Background(), plan, ApplyOptions{DisableAudit: true}); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(extracted, "source", "file"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "zip payload" {
+	if string(data) != payload {
 		t.Fatalf("got %q", data)
 	}
 }

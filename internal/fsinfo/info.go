@@ -40,6 +40,32 @@ type Entry struct {
 	Executable bool      `json:"executable,omitempty"`
 }
 
+// PathExpectation records whether a path existed and, when it did, the exact
+// object observed there. Keeping absence explicit lets mutation plans guard a
+// destination that was empty when the plan was reviewed.
+type PathExpectation struct {
+	Path   string `json:"path"`
+	Exists bool   `json:"exists"`
+	Entry  *Entry `json:"entry,omitempty"`
+}
+
+// CapturePath records the current no-follow state of path. A missing final
+// component is a valid state; all other inspection errors are returned.
+func CapturePath(path string) (PathExpectation, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return PathExpectation{}, fmt.Errorf("absolute path: %w", err)
+	}
+	entry, err := Inspect(abs, false)
+	if err == nil {
+		return PathExpectation{Path: abs, Exists: true, Entry: &entry}, nil
+	}
+	if os.IsNotExist(err) {
+		return PathExpectation{Path: abs}, nil
+	}
+	return PathExpectation{}, err
+}
+
 // Inspect loads metadata without following the final symlink unless follow is
 // true. Paths are made absolute but are not required to be inside a scan root.
 func Inspect(path string, follow bool) (Entry, error) {
@@ -99,15 +125,24 @@ func SameObject(expected, actual Entry) bool {
 }
 
 // Volume describes capacity and inode pressure for the filesystem containing
-// Path. Filesystem and MountPoint are filled by higher-level platform discovery
-// when available.
+// Path. Path is the caller-facing absolute path; ResolvedPath and all volume
+// identity/capacity fields describe the same symlink-resolved target.
 type Volume struct {
-	Path       string  `json:"path"`
-	MountPoint string  `json:"mount_point,omitempty"`
-	Filesystem string  `json:"filesystem,omitempty"`
-	Total      uint64  `json:"total_bytes"`
-	Free       uint64  `json:"free_bytes"`
-	Available  uint64  `json:"available_bytes"`
+	Path              string  `json:"path"`
+	ResolvedPath      string  `json:"resolved_path"`
+	MountPoint        string  `json:"mount_point,omitempty"`
+	Filesystem        string  `json:"filesystem,omitempty"`
+	Device            string  `json:"device,omitempty"`
+	Total             uint64  `json:"total_bytes"`
+	Free              uint64  `json:"free_bytes"`
+	Available         uint64  `json:"available_bytes"`
+	Reserved          uint64  `json:"reserved_bytes,omitempty"`
+	PhysicalUsed      uint64  `json:"physical_used_bytes"`
+	PhysicalUsedPct   float64 `json:"physical_used_percent"`
+	CallerCapacity    uint64  `json:"caller_capacity_bytes"`
+	CallerPressurePct float64 `json:"caller_pressure_percent"`
+	// Used and UsedPct are compatibility aliases for physical allocation.
+	// New consumers should use the explicitly named fields above.
 	Used       uint64  `json:"used_bytes"`
 	UsedPct    float64 `json:"used_percent"`
 	Inodes     uint64  `json:"inodes,omitempty"`
@@ -121,19 +156,37 @@ func VolumeFor(path string) (Volume, error) {
 	if err != nil {
 		return Volume{}, err
 	}
-	v, err := platformVolumeFor(abs)
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return Volume{}, fmt.Errorf("resolve volume path %q: %w", abs, err)
+	}
+	v, err := platformVolumeFor(resolved)
 	if err != nil {
 		return Volume{}, err
 	}
 	v.Path = abs
+	v.ResolvedPath = resolved
+	finalizeVolume(&v)
+	return v, nil
+}
+
+func finalizeVolume(v *Volume) {
 	if v.Total >= v.Free {
-		v.Used = v.Total - v.Free
+		v.PhysicalUsed = v.Total - v.Free
 	}
+	v.Used = v.PhysicalUsed
 	if v.Total > 0 {
-		v.UsedPct = float64(v.Used) * 100 / float64(v.Total)
+		v.PhysicalUsedPct = float64(v.PhysicalUsed) * 100 / float64(v.Total)
+	}
+	v.UsedPct = v.PhysicalUsedPct
+	if v.Free >= v.Available {
+		v.Reserved = v.Free - v.Available
+	}
+	v.CallerCapacity = v.PhysicalUsed + v.Available
+	if v.CallerCapacity > 0 {
+		v.CallerPressurePct = float64(v.PhysicalUsed) * 100 / float64(v.CallerCapacity)
 	}
 	if v.Inodes > 0 && v.Inodes >= v.InodesFree {
 		v.InodePct = float64(v.Inodes-v.InodesFree) * 100 / float64(v.Inodes)
 	}
-	return v, nil
 }

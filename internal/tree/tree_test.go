@@ -63,6 +63,37 @@ func TestShallowCloneNilAndZero(t *testing.T) {
 	}
 }
 
+func TestMoveToRelocatesAndRebasesSubtree(t *testing.T) {
+	root := &Node{Name: "root", IsDir: true}
+	a := &Node{Name: "a", IsDir: true}
+	b := &Node{Name: "b", IsDir: true}
+	moved := &Node{Name: "old", IsDir: true}
+	leaf := &Node{Name: "leaf"}
+	root.Adopt(a)
+	root.Adopt(b)
+	b.Adopt(moved)
+	moved.Adopt(leaf)
+
+	if !moved.MoveTo(a, "shared") {
+		t.Fatal("MoveTo rejected a valid relocation")
+	}
+	if moved.Parent() != a || moved.Path() != "a/shared" || moved.Depth != 2 {
+		t.Fatalf("moved node = parent %p path %q depth %d", moved.Parent(), moved.Path(), moved.Depth)
+	}
+	if leaf.Parent() != moved || leaf.Path() != "a/shared/leaf" || leaf.Depth != 3 {
+		t.Fatalf("moved leaf = parent %p path %q depth %d", leaf.Parent(), leaf.Path(), leaf.Depth)
+	}
+	if len(b.Children) != 0 || len(a.Children) != 1 || a.Children[0] != moved {
+		t.Fatalf("relocation structure = a:%+v b:%+v", a.Children, b.Children)
+	}
+	if root.Children[0] != a || root.Children[1] != b {
+		t.Fatalf("destination ordering = %q, %q", root.Children[0].Name, root.Children[1].Name)
+	}
+	if a.MoveTo(leaf, "cycle") {
+		t.Fatal("MoveTo accepted a cycle")
+	}
+}
+
 func countNodes(n *Node) int {
 	if n == nil {
 		return 0

@@ -150,6 +150,54 @@ func (n *Node) Adopt(c *Node) {
 	n.Children = append(n.Children, c)
 }
 
+// MoveTo detaches n from its current parent and reattaches the whole subtree
+// under parent with name. Descendant depths are rebased and the destination's
+// children remain name-ordered. Aggregate fields are intentionally unchanged;
+// callers that move measured subtrees must reconcile their ancestor totals.
+// It returns false for roots, nil destinations, cycles, or malformed trees.
+func (n *Node) MoveTo(parent *Node, name string) bool {
+	if n == nil || n.parent == nil || parent == nil {
+		return false
+	}
+	for ancestor := parent; ancestor != nil; ancestor = ancestor.parent {
+		if ancestor == n {
+			return false
+		}
+	}
+
+	oldParent := n.parent
+	oldIndex := -1
+	for i, child := range oldParent.Children {
+		if child == n {
+			oldIndex = i
+			break
+		}
+	}
+	if oldIndex < 0 {
+		return false
+	}
+	copy(oldParent.Children[oldIndex:], oldParent.Children[oldIndex+1:])
+	oldParent.Children[len(oldParent.Children)-1] = nil
+	oldParent.Children = oldParent.Children[:len(oldParent.Children)-1]
+
+	n.Name = name
+	n.parent = parent
+	n.rebaseDepth(parent.Depth + 1)
+	parent.Children = append(parent.Children, n)
+	sort.SliceStable(parent.Children, func(i, j int) bool {
+		return parent.Children[i].Name < parent.Children[j].Name
+	})
+	return true
+}
+
+func (n *Node) rebaseDepth(depth int) {
+	n.Depth = depth
+	for _, child := range n.Children {
+		child.parent = n
+		child.rebaseDepth(depth + 1)
+	}
+}
+
 // Sort orders this node's children (and recurses) according to mode.
 func (n *Node) Sort(mode SortMode, sm SizeMode) {
 	sort.SliceStable(n.Children, func(i, j int) bool {

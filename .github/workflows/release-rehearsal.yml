@@ -1,0 +1,397 @@
+name: Release rehearsal
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '41 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Semver-shaped version to embed without publishing
+        required: false
+        default: v0.0.0-rehearsal
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rehearsal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'v0.0.0-rehearsal' }}
+  GOTOOLCHAIN: local
+
+jobs:
+  validate:
+    name: validate rehearsal source
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      build_date: ${{ steps.source.outputs.build_date }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Validate version and capture source identity
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/validate-release-tag.sh "$RELEASE_TAG"
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'build_date=%s\n' "$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: native tests / ${{ matrix.runner }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-latest
+          - windows-latest
+          - windows-11-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Run tests and vet
+        run: go test ./... -count=1
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Build native CLI
+        run: go build -trimpath ./cmd/dirstat
+
+  lint:
+    name: full golangci-lint policy
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run golangci-lint, including test code
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.11.4
+          args: --timeout=5m
+
+      - name: Verify lint configuration and formatting
+        run: |
+          golangci-lint config verify
+          golangci-lint fmt --diff
+
+  race:
+    name: race detector
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run race-enabled tests
+        run: go test -race ./... -count=1
+
+  govulncheck:
+    name: govulncheck rehearsal source
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Install govulncheck
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Reject reachable vulnerabilities
+        run: '"$RUNNER_TEMP/bin/govulncheck" ./...'
+
+  build:
+    name: package / ${{ matrix.os }}-${{ matrix.arch }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            archive: zip
+          - os: windows
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            archive: zip
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Build reproducible rehearsal archive
+        shell: bash
+        run: >-
+          bash .github/scripts/package-release.sh
+          "$RELEASE_TAG"
+          "${{ matrix.os }}"
+          "${{ matrix.arch }}"
+          "${{ matrix.goos }}"
+          "${{ matrix.goarch }}"
+          "${{ matrix.archive }}"
+          dist
+
+      - name: Upload rehearsal archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/dirstat-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  artifact-smoke:
+    name: native archive smoke / ${{ matrix.os }}-${{ matrix.arch }}
+    needs:
+      - validate
+      - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - runner: macos-15-intel
+            os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - runner: macos-latest
+            os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - runner: windows-latest
+            os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            archive: zip
+          - runner: windows-11-arm
+            os: windows
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            archive: zip
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Download target archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist
+
+      - name: Verify contents, metadata, and native behavior
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+          SOURCE_BUILD_DATE: ${{ needs.validate.outputs.build_date }}
+        run: >-
+          bash .github/scripts/verify-release-artifact.sh
+          "$RELEASE_TAG"
+          "${{ matrix.os }}"
+          "${{ matrix.arch }}"
+          "${{ matrix.goos }}"
+          "${{ matrix.goarch }}"
+          "dist/dirstat-${RELEASE_TAG}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}"
+          "$SOURCE_COMMIT"
+          "$SOURCE_BUILD_DATE"
+          true
+
+  supply-chain:
+    name: rehearse checksums and SBOM
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download all rehearsal archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: rehearsal-*-*
+          path: dist/artifacts
+          merge-multiple: true
+
+      - name: Prepare metadata directory
+        shell: bash
+        run: mkdir -p dist/metadata
+
+      - name: Generate SPDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/metadata/dirstat-${{ env.RELEASE_TAG }}.spdx.json
+          syft-version: v1.44.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Create and self-check rehearsal checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist/artifacts -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+          mkdir -p dist/checksum-input
+          cp dist/artifacts/* dist/checksum-input/
+          cp dist/metadata/*.spdx.json dist/checksum-input/
+          (cd dist/checksum-input && sha256sum ./* | LC_ALL=C sort > ../metadata/SHA256SUMS)
+          (cd dist/checksum-input && sha256sum -c ../metadata/SHA256SUMS)
+
+      - name: Upload rehearsal metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-metadata
+          path: dist/metadata/*
+          if-no-files-found: error
+          retention-days: 14
+
+  rehearsal-gate:
+    name: full non-publishing rehearsal passed
+    needs:
+      - validate
+      - test
+      - lint
+      - race
+      - govulncheck
+      - build
+      - artifact-smoke
+      - supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download rehearsal archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: rehearsal-*-*
+          path: dist/bundle
+          merge-multiple: true
+
+      - name: Download rehearsal metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-metadata
+          path: dist/bundle
+
+      - name: Verify complete rehearsal bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist/bundle -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+          test -f "dist/bundle/dirstat-${RELEASE_TAG}.spdx.json"
+          (cd dist/bundle && sha256sum -c SHA256SUMS)
+
+      - name: Retain complete rehearsal evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-rehearsal-bundle
+          path: dist/bundle/*
+          if-no-files-found: error
+          retention-days: 14

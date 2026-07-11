@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/phillipod/go-dirstat/internal/format"
 	"github.com/phillipod/go-dirstat/internal/fsinfo"
 	"github.com/phillipod/go-dirstat/internal/fsops"
+	"github.com/phillipod/go-dirstat/internal/history"
 	"github.com/phillipod/go-dirstat/internal/index"
 	"github.com/phillipod/go-dirstat/internal/preview"
 	"github.com/phillipod/go-dirstat/internal/scan"
@@ -23,6 +25,8 @@ const (
 	viewTree viewMode = iota
 	viewExt
 	viewLargest
+	viewGrowth
+	viewOpenDeleted
 	viewHelp
 )
 
@@ -46,7 +50,7 @@ func (m extSortMode) String() string {
 	case extSortName:
 		return "name"
 	default:
-		return "unknown"
+		return unknownLabel
 	}
 }
 
@@ -70,6 +74,19 @@ type model struct {
 	scanNote         string // e.g. "scan stopped" after retaining partial results
 	cacheErr         error  // cache failures are visible without failing a good scan
 	scanErr          error
+	snapshotAt       time.Time
+
+	volume          fsinfo.Volume
+	volumeLoadedAt  time.Time
+	volumeErr       error
+	targetAvailable uint64
+	targeting       bool
+	targetInput     string
+
+	analysisCancel     context.CancelFunc
+	analysisGeneration uint64
+	growth             growthViewState
+	openDeleted        openDeletedViewState
 
 	root  *tree.Node
 	stats scan.Stats
@@ -91,7 +108,13 @@ type model struct {
 	management       managementMode
 	managementInput  string
 	managementError  string
+	managementNote   string
 	managementAction fsops.Action
+	managementCursor int
+	managementOffset int
+	managementSeen   int
+	managementDryRun bool
+	destination      destinationPickerState
 	queue            []fsops.Operation
 	applyResults     []fsops.Result
 	applyCancel      context.CancelFunc
@@ -107,10 +130,13 @@ type model struct {
 	expanded map[string]bool // keyed by node.Path(); root is ""
 
 	// cache wiring
-	store       *index.Store // nil when caching is disabled or unavailable
-	rootAbs     string
-	fingerprint string
-	cacheSaves  cacheSaveCoordinator
+	store         *index.Store // nil when caching is disabled or unavailable
+	cacheWritable bool
+	rootAbs       string
+	fingerprint   string
+	historyDir    string
+	historyErr    error
+	cacheSaves    cacheSaveCoordinator
 
 	rows   []row // flattened, visible rows for the tree view
 	cursor int   // index into rows (tree) or extRows (ext view)
@@ -136,25 +162,51 @@ func newModel(app *App) *model {
 	if err != nil {
 		abs = app.path
 	}
+	historyDir, historyErr := history.DefaultStoreDir()
+	if historyErr == nil && !app.opts.ReadOnly {
+		maxRecords := app.opts.HistoryMax
+		if maxRecords <= 0 {
+			maxRecords = history.MaxRecords
+		}
+		_, historyErr = history.NewStoreAtWithPolicy(historyDir, maxRecords, tuiHistoryPolicy(app.opts))
+	}
+	if historyErr == nil {
+		app.policy, _, _, historyErr = historyAwarePolicy(abs, app.policy, historyDir)
+	}
 	m := &model{
-		app:          app,
-		ctx:          context.Background(),
-		scanning:     true,
-		view:         viewTree,
-		returnView:   viewTree,
-		sort:         tree.SortSizeDesc,
-		extSort:      extSortSize,
-		sizeMode:     app.sizeMode,
-		expanded:     map[string]bool{"": true}, // root expanded by default
-		marks:        make(map[string]bool),
-		contextPanel: true,
-		root:         &tree.Node{Name: filepath.Base(abs), IsDir: true, Depth: 0},
-		rootAbs:      abs,
-		fingerprint:  index.Fingerprint(abs, app.policy),
+		app:             app,
+		ctx:             context.Background(),
+		scanning:        true,
+		view:            viewTree,
+		returnView:      viewTree,
+		sort:            tree.SortSizeDesc,
+		extSort:         extSortSize,
+		sizeMode:        app.sizeMode,
+		expanded:        map[string]bool{"": true}, // root expanded by default
+		marks:           make(map[string]bool),
+		contextPanel:    true,
+		root:            &tree.Node{Name: filepath.Base(abs), IsDir: true, Depth: 0},
+		rootAbs:         abs,
+		fingerprint:     index.Fingerprint(abs, app.policy),
+		historyDir:      historyDir,
+		historyErr:      historyErr,
+		targetAvailable: app.opts.TargetAvailableBytes,
 	}
 	if app.opts.UseCache {
-		if st, err := index.NewStore(); err == nil {
+		cacheDir, cacheDirErr := index.DefaultStoreDir()
+		var st *index.Store
+		if cacheDirErr == nil {
+			if app.opts.ReadOnly {
+				st, err = index.OpenStoreAtWithPolicy(cacheDir, tuiCachePolicy(app.opts))
+			} else {
+				st, err = index.NewStoreAtWithPolicy(cacheDir, tuiCachePolicy(app.opts))
+			}
+		} else {
+			err = cacheDirErr
+		}
+		if err == nil {
 			m.store = st
+			m.cacheWritable = !app.opts.ReadOnly
 		} else {
 			m.cacheErr = fmt.Errorf("cache unavailable: %w", err)
 		}
@@ -162,25 +214,48 @@ func newModel(app *App) *model {
 	return m
 }
 
+func tuiCachePolicy(opts Options) index.Policy {
+	policy := index.DefaultPolicy()
+	if opts.CacheMaxBytes > 0 {
+		policy.MaxBytes = opts.CacheMaxBytes
+	}
+	if opts.CacheMaxAge > 0 {
+		policy.MaxAge = opts.CacheMaxAge
+	}
+	return policy
+}
+
+func tuiHistoryPolicy(opts Options) history.Policy {
+	policy := history.DefaultPolicy()
+	if opts.HistoryMaxBytes > 0 {
+		policy.MaxBytes = opts.HistoryMaxBytes
+	}
+	if opts.HistoryMaxAge > 0 {
+		policy.MaxAge = opts.HistoryMaxAge
+	}
+	return policy
+}
+
 // Init loads a cached snapshot instantly (if one exists and caching is on), then
 // kicks off a background refresh scan that streams updates regardless.
 func (m *model) Init() tea.Cmd {
 	if m.store != nil {
-		if snap, err := m.store.Load(m.rootAbs, m.fingerprint); err == nil {
+		if snap, err := m.store.LoadContext(m.ctx, m.rootAbs, m.fingerprint); err == nil {
 			if node := snap.ToTree(); node != nil {
 				m.root = node
-				m.stats = scan.Stats{Files: snap.Files, Dirs: snap.Dirs, Errors: snap.Errors, RootFS: snap.RootFS}
+				m.stats = scan.Stats{Files: snap.Files, Dirs: snap.Dirs, Errors: snap.Errors, RootFS: snap.RootFS, Complete: snap.Complete}
 				m.gotData = true
-				m.completeTree = true
+				m.completeTree = snap.Complete
 				m.cacheNote = "cached " + format.Age(index.Age(snap)) + ", refreshing…"
+				m.snapshotAt = snap.ScannedAt
 				m.rebuild()
-				return m.startScan()
+				return tea.Batch(m.startScan(), m.loadPressureCmd())
 			}
 		} else if !index.IsMissing(err) {
 			m.cacheErr = fmt.Errorf("cache load failed: %w", err)
 		}
 	}
-	return m.startScan()
+	return tea.Batch(m.startScan(), m.loadPressureCmd())
 }
 
 // progressMsg carries a partial snapshot of the in-progress tree, delivered in
@@ -217,6 +292,16 @@ type appliedMsg struct {
 	err     error
 }
 
+type dryRunMsg struct {
+	results []fsops.Result
+	err     error
+}
+
+type exportedPlanMsg struct {
+	path string
+	err  error
+}
+
 type externalDoneMsg struct {
 	kind string
 	err  error
@@ -233,7 +318,7 @@ func (m *model) selectedAbsolutePath() string {
 		if r := m.currentRow(); r != nil {
 			rel = r.node.Path()
 		}
-	case viewExt, viewHelp:
+	case viewExt, viewGrowth, viewOpenDeleted, viewHelp:
 		return ""
 	}
 	if rel == "" || rel == "." {

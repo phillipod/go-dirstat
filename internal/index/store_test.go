@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -13,9 +14,14 @@ import (
 
 func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store := &Store{dir: dir}
+	store, err := NewStoreAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := filepath.Join(t.TempDir(), "scan-root")
-	snap := FromTree(&tree.Node{Name: "scan-root", IsDir: true, Apparent: 42, Alloc: 512}, "scope-fp", "ext4", 1, 0, 0, time.Now())
+	node := &tree.Node{Name: "scan-root", IsDir: true, Apparent: 42, Alloc: 1024, FileCount: 1}
+	node.Adopt(&tree.Node{Name: "file", Apparent: 42, Alloc: 512})
+	snap := FromTree(node, "scope-fp", "ext4", 1, 1, 0, true, time.Now())
 	snap.Root = root
 
 	if err := store.Save(snap); err != nil {
@@ -25,7 +31,7 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got.Root != root || got.Fingerprint != snap.Fingerprint || got.Nodes[0].Alloc != 512 {
+	if got.Root != root || got.Fingerprint != snap.Fingerprint || got.Nodes[0].Alloc != 1024 {
 		t.Errorf("Load() = %+v, want saved snapshot", got)
 	}
 
@@ -39,15 +45,21 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 }
 
 func TestStoreLoadMissing(t *testing.T) {
-	store := &Store{dir: t.TempDir()}
-	_, err := store.Load("/missing", "scope-fp")
+	store, err := NewStoreAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Load("/missing", "scope-fp")
 	if !IsMissing(err) || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Load() error = %v, want fs.ErrNotExist", err)
 	}
 }
 
 func TestStoreSaveRejectsIncompleteSnapshot(t *testing.T) {
-	store := &Store{dir: t.TempDir()}
+	store, err := NewStoreAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, snap := range map[string]*Snapshot{
 		"nil":                 nil,
 		"missing root":        {Fingerprint: "scope-fp"},
@@ -64,9 +76,12 @@ func TestStoreSaveRejectsIncompleteSnapshot(t *testing.T) {
 
 func TestStoreCacheKeyCannotEscapeDirectory(t *testing.T) {
 	dir := t.TempDir()
-	store := &Store{dir: dir}
-	snap := FromTree(&tree.Node{Name: "root", IsDir: true}, "../../outside", "", 0, 1, 0, time.Now())
-	snap.Root = "/tmp/root"
+	store, err := NewStoreAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := FromTree(&tree.Node{Name: "root", IsDir: true}, "../../outside", "", 0, 1, 0, true, time.Now())
+	snap.Root = testIndexAbsolutePath("tmp", "root")
 
 	if err := store.Save(snap); err != nil {
 		t.Fatal(err)
@@ -82,11 +97,14 @@ func TestStoreCacheKeyCannotEscapeDirectory(t *testing.T) {
 
 func TestStoreLoadRejectsSnapshotForDifferentRoot(t *testing.T) {
 	dir := t.TempDir()
-	store := &Store{dir: dir}
-	wantRoot := "/tmp/wanted"
+	store, err := NewStoreAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot := testIndexAbsolutePath("tmp", "wanted")
 	fingerprint := "scope-fp"
-	snap := FromTree(&tree.Node{Name: "other", IsDir: true}, fingerprint, "", 0, 1, 0, time.Now())
-	snap.Root = "/tmp/other"
+	snap := FromTree(&tree.Node{Name: "other", IsDir: true}, fingerprint, "", 0, 1, 0, true, time.Now())
+	snap.Root = testIndexAbsolutePath("tmp", "other")
 	data, err := snap.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -110,6 +128,48 @@ func TestStoreSaveReportsWriteFailure(t *testing.T) {
 	if err := store.Save(snap); err == nil {
 		t.Fatal("Save() error = nil, want temporary-file creation error")
 	}
+}
+
+func TestStoreWriteEnforcesGlobalTTL(t *testing.T) {
+	base := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	store, err := NewStoreAtWithPolicy(t.TempDir(), Policy{MaxBytes: 1 << 20, MaxAge: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return base }
+	old := testStoreSnapshot(filepath.Join(t.TempDir(), "old"), "old-fingerprint", base)
+	if err := store.Save(old); err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return base.Add(2 * time.Hour) }
+	current := testStoreSnapshot(filepath.Join(t.TempDir(), "current"), "current-fingerprint", base.Add(2*time.Hour))
+	if err := store.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Root != current.Root || !entries[0].Valid {
+		t.Fatalf("post-TTL entries = %#v", entries)
+	}
+	if _, err := os.Lstat(store.pathFor(old.Root, old.Fingerprint)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expired cache entry remains: %v", err)
+	}
+}
+
+func testStoreSnapshot(root, fingerprint string, at time.Time) *Snapshot {
+	node := &tree.Node{Name: filepath.Base(root), IsDir: true}
+	snapshot := FromTree(node, fingerprint, "", 0, 1, 0, true, at)
+	snapshot.Root = root
+	return snapshot
+}
+
+func testIndexAbsolutePath(parts ...string) string {
+	if runtime.GOOS == windowsOS {
+		return filepath.Join(append([]string{`C:\`}, parts...)...)
+	}
+	return filepath.Join(append([]string{string(filepath.Separator)}, parts...)...)
 }
 
 func TestAge(t *testing.T) {

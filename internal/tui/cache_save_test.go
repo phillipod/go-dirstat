@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/phillipod/go-dirstat/internal/scan"
 	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
@@ -99,6 +100,7 @@ func TestCacheSaveCoordinatorKeepsLastSuccessEligibleAfterNewerScanFailsOrStops(
 			m = asModel(t, m, scanDoneMsg{
 				generation: 1,
 				node:       &tree.Node{Name: "good", IsDir: true},
+				stats:      scan.Stats{Dirs: 1, Complete: true},
 			})
 			if saved, err := m.cacheSaves.save(0, func() error {
 				t.Fatal("save from before the accepted successful scan ran")

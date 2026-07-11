@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,6 +21,13 @@ import (
 	"github.com/phillipod/go-dirstat/internal/scan"
 	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
+)
+
+const (
+	testBigFile     = "big.bin"
+	testGoExtension = ".go"
+	testGoFile      = "a.go"
+	testSubdir      = "sub"
 )
 
 // asModel drives a model through Update and returns the concrete *model,
@@ -49,10 +57,10 @@ func mkTree(t *testing.T) (string, *tree.Node) {
 			t.Fatal(err)
 		}
 	}
-	must(filepath.Join(root, "big.bin"), 5000)
-	must(filepath.Join(root, "a.go"), 100)
-	must(filepath.Join(root, "sub", "c.md"), 50)
-	must(filepath.Join(root, "sub", "deep", "d.txt"), 20)
+	must(filepath.Join(root, testBigFile), 5000)
+	must(filepath.Join(root, testGoFile), 100)
+	must(filepath.Join(root, testSubdir, "c.md"), 50)
+	must(filepath.Join(root, testSubdir, "deep", "d.txt"), 20)
 
 	node, _, err := scan.Scan(context.Background(), root, scan.WithPolicy(scope.New()))
 	if err != nil {
@@ -66,14 +74,14 @@ func TestModelScanAndTreeRender(t *testing.T) {
 	app := New(path, scope.New(), tree.SizeApparent, 0, Options{})
 	m := newModel(app)
 
-	m = asModel(t, m, scanDoneMsg{node: node})
+	m = asModel(t, m, scanDoneMsg{node: node, stats: scan.Stats{Files: node.FileCount, Dirs: node.DirCount + 1, Complete: true}})
 	if !m.gotData {
 		t.Fatal("model has no data after scan")
 	}
 	m = asModel(t, m, tea.WindowSizeMsg{Width: 100, Height: 24})
 
 	v := m.View()
-	for _, want := range []string{"big.bin", "sub/", "a.go", "move"} {
+	for _, want := range []string{testBigFile, testSubdir + "/", testGoFile, "move"} {
 		if !contains(v, want) {
 			t.Errorf("View missing %q", want)
 		}
@@ -92,12 +100,12 @@ func TestModelExpandCollapseNavigate(t *testing.T) {
 		t.Fatal("deep/ is visible before sub is expanded")
 	}
 	for i, r := range m.rows {
-		if r.node.Name == "sub" {
+		if r.node.Name == testSubdir {
 			m.cursor = i
 			break
 		}
 	}
-	if m.currentRow() == nil || m.currentRow().node.Name != "sub" {
+	if m.currentRow() == nil || m.currentRow().node.Name != testSubdir {
 		t.Fatal("sub row not found")
 	}
 	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
@@ -116,7 +124,7 @@ func TestModelExtView(t *testing.T) {
 	if m.view != viewExt {
 		t.Fatalf("view = %v, want ext", m.view)
 	}
-	if !contains(m.View(), ".go") {
+	if !contains(m.View(), testGoExtension) {
 		t.Error("ext view missing .go")
 	}
 }
@@ -132,10 +140,10 @@ func TestModelLargestFilesView(t *testing.T) {
 	if m.view != viewLargest {
 		t.Fatalf("view = %v, want largest files", m.view)
 	}
-	if len(m.topRows) == 0 || m.topRows[0].file.Rel != "big.bin" {
+	if len(m.topRows) == 0 || m.topRows[0].file.Rel != testBigFile {
 		t.Fatalf("largest rows = %+v, want big.bin first", m.topRows)
 	}
-	for _, want := range []string{"big.bin", "largest files", "top:100"} {
+	for _, want := range []string{testBigFile, "largest files", "top:100"} {
 		if !contains(m.View(), want) {
 			t.Errorf("largest-files view missing %q\n%s", want, m.View())
 		}
@@ -180,7 +188,7 @@ func TestPageKeysUseBubbleTeaKeyNames(t *testing.T) {
 	}
 	app := New("/root", scope.New(), tree.SizeApparent, 0, Options{})
 	m := newModel(app)
-	m = asModel(t, m, scanDoneMsg{node: root})
+	m = asModel(t, m, scanDoneMsg{node: root, stats: scan.Stats{Files: root.FileCount, Dirs: root.DirCount + 1, Complete: true}})
 	m = asModel(t, m, tea.WindowSizeMsg{Width: 80, Height: 8})
 	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyPgDown})
 	if m.cursor != m.page() {
@@ -220,7 +228,7 @@ func TestExtensionSortCycleIsEffectiveAndLabeled(t *testing.T) {
 	m = asModel(t, m, tea.WindowSizeMsg{Width: 100, Height: 24})
 	m = asModel(t, m, key("e"))
 
-	if got := m.extRows[0].ext.Ext; got != ".go" {
+	if got := m.extRows[0].ext.Ext; got != testGoExtension {
 		t.Fatalf("size-sorted top extension = %q, want .go", got)
 	}
 	m = asModel(t, m, key("s"))
@@ -232,6 +240,62 @@ func TestExtensionSortCycleIsEffectiveAndLabeled(t *testing.T) {
 	}
 	if !contains(m.headerView(), "sort:count") {
 		t.Errorf("extension header does not label active count sort\n%s", m.headerView())
+	}
+}
+
+func TestFilterAppliesToEveryDataView(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m = asModel(t, m, scanDoneMsg{node: node, stats: scan.Stats{Complete: true}})
+	m.filter = testGoExtension
+	m.rebuild()
+	if len(m.rows) == 0 {
+		t.Fatal("tree filter produced no rows")
+	}
+	for _, row := range m.rows {
+		if !strings.Contains(strings.ToLower(row.node.Path()), testGoExtension) {
+			t.Fatalf("tree filter retained %q", row.node.Path())
+		}
+	}
+	if len(m.extRows) != 1 || m.extRows[0].ext.Ext != testGoExtension {
+		t.Fatalf("extension filter rows = %#v", m.extRows)
+	}
+	if len(m.topRows) != 1 || m.topRows[0].file.Rel != testGoFile {
+		t.Fatalf("largest-file filter rows = %#v", m.topRows)
+	}
+	m.filter = "no-such-value"
+	m.rebuild()
+	if len(m.rows) != 0 || len(m.extRows) != 0 || len(m.topRows) != 0 || m.cursor != 0 {
+		t.Fatalf("empty filtered views: tree=%d ext=%d top=%d cursor=%d", len(m.rows), len(m.extRows), len(m.topRows), m.cursor)
+	}
+}
+
+func TestViewSwitchInvalidatesAndRequestsCurrentInspection(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m = asModel(t, m, scanDoneMsg{node: node, stats: scan.Stats{Complete: true}})
+	m.inspectPath = filepath.Join(path, "stale")
+	oldGeneration := m.inspectGeneration
+	updated, cmd := m.Update(key("f"))
+	m = updated.(*model)
+	if cmd == nil || m.view != viewLargest || m.inspectPath != "" || m.inspectGeneration <= oldGeneration {
+		t.Fatalf("largest switch: command=%t view=%v inspect=%q generation=%d", cmd != nil, m.view, m.inspectPath, m.inspectGeneration)
+	}
+	want := m.selectedAbsolutePath()
+	msg := cmd()
+	m = asModel(t, m, msg)
+	if m.inspectPath != want {
+		t.Fatalf("inspection path = %q, want current selection %q", m.inspectPath, want)
+	}
+	currentGeneration := m.inspectGeneration
+	m = asModel(t, m, inspectMsg{generation: oldGeneration, path: filepath.Join(path, "stale")})
+	if m.inspectGeneration != currentGeneration || m.inspectPath != want {
+		t.Fatal("stale pre-switch inspection replaced current metadata")
+	}
+	updated, cmd = m.Update(key("e"))
+	m = updated.(*model)
+	if cmd != nil || m.view != viewExt || m.inspectPath != "" {
+		t.Fatalf("extension switch: command=%t view=%v inspect=%q", cmd != nil, m.view, m.inspectPath)
 	}
 }
 
@@ -255,7 +319,7 @@ func TestExtensionRowsHonorSizeMode(t *testing.T) {
 	m := newModel(app)
 	m = asModel(t, m, scanDoneMsg{node: root})
 
-	if got := m.extRows[0].ext.Ext; got != ".go" {
+	if got := m.extRows[0].ext.Ext; got != testGoExtension {
 		t.Fatalf("apparent-size top extension = %q, want .go", got)
 	}
 	m = asModel(t, m, key("m"))
@@ -280,7 +344,7 @@ func TestExtensionDetailReportsSizeAndPercentage(t *testing.T) {
 	m = asModel(t, m, key("e"))
 
 	detail := m.detailLine()
-	for _, want := range []string{".go", format.Bytes(900), "1 files", "90.0% of total"} {
+	for _, want := range []string{testGoExtension, format.Bytes(900), "1 files", "90.0% of total"} {
 		if !contains(detail, want) {
 			t.Errorf("extension detail missing %q: %s", want, detail)
 		}
@@ -492,6 +556,33 @@ func TestRefreshRetainsExistingTreeUntilCompletion(t *testing.T) {
 	}
 }
 
+func TestCompleteRefreshReconcilesStaleMarksAndClearAll(t *testing.T) {
+	path, node := mkTree(t)
+	existing := filepath.Join(path, testBigFile)
+	missing := filepath.Join(path, "removed.bin")
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m.marks[existing], m.marks[missing] = true, true
+	m = asModel(t, m, scanDoneMsg{node: node, stats: scan.Stats{Complete: true}})
+	if !m.marks[existing] || m.marks[missing] || !contains(m.scanNote, "cleared 1 stale mark") {
+		t.Fatalf("reconciled marks=%v note=%q", m.marks, m.scanNote)
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyCtrlX})
+	if len(m.marks) != 0 || !contains(m.scanNote, "cleared 1 mark") {
+		t.Fatalf("clear-all marks=%v note=%q", m.marks, m.scanNote)
+	}
+}
+
+func TestPartialRefreshRetainsUnresolvedMarksAndSkipsCompleteCacheState(t *testing.T) {
+	path, node := mkTree(t)
+	unresolved := filepath.Join(path, "not-visible-in-partial-tree")
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m.marks[unresolved] = true
+	m = asModel(t, m, scanDoneMsg{node: node, stats: scan.Stats{Errors: 1, Complete: false}})
+	if !m.marks[unresolved] || m.completeTree || !contains(m.scanNote, "unresolved marks retained") {
+		t.Fatalf("partial refresh: marks=%v complete=%t note=%q", m.marks, m.completeTree, m.scanNote)
+	}
+}
+
 func TestQuitCancelsActiveScan(t *testing.T) {
 	app := New(t.TempDir(), scope.New(), tree.SizeApparent, 0, Options{})
 	m := newModel(app)
@@ -611,7 +702,7 @@ func TestModelStreamsProgress(t *testing.T) {
 		Name: filepath.Base(path), IsDir: true, Depth: 0,
 		Apparent: 50, FileCount: 1,
 	}
-	partial.AddChild(&tree.Node{Name: "sub", IsDir: true, Apparent: 50})
+	partial.AddChild(&tree.Node{Name: testSubdir, IsDir: true, Apparent: 50})
 	m = asModel(t, m, progressMsg{node: partial, stats: scan.Stats{Files: 1}})
 	if !contains(m.View(), "sub/") {
 		t.Error("view did not adopt streamed snapshot (missing sub/)")
@@ -619,7 +710,7 @@ func TestModelStreamsProgress(t *testing.T) {
 
 	// The final, complete tree supersedes the snapshot.
 	m = asModel(t, m, scanDoneMsg{node: full})
-	if !contains(m.View(), "big.bin") {
+	if !contains(m.View(), testBigFile) {
 		t.Error("view did not render final tree")
 	}
 	if contains(m.headerView(), "scanning") {
@@ -632,9 +723,9 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	auditPath := filepath.Join(t.TempDir(), "tui-audit.jsonl")
 	app := New(path, scope.New(), tree.SizeApparent, 0, Options{AuditPath: auditPath})
 	m := newModel(app)
-	m = asModel(t, m, scanDoneMsg{node: node})
+	m = asModel(t, m, scanDoneMsg{node: node, stats: scan.Stats{Files: node.FileCount, Dirs: node.DirCount + 1, Complete: true}})
 	for i := range m.rows {
-		if m.rows[i].node.Name == "big.bin" {
+		if m.rows[i].node.Name == testBigFile {
 			m.cursor = i
 			break
 		}
@@ -673,7 +764,7 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	if m.management != managementConfirm || !contains(m.managementError, "APPLY exactly") {
 		t.Fatal("lowercase confirmation was accepted")
 	}
-	m.managementInput, m.managementError = "APPLY", ""
+	m.managementInput, m.managementError = applyConfirm, ""
 	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(*model)
 	if cmd == nil || m.management != managementApplying {
@@ -699,7 +790,7 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 		t.Fatalf("file totals = tree:%d stats:%d, want %d", m.root.FileCount, m.stats.Files, beforeFiles-1)
 	}
 	for _, row := range m.topRows {
-		if row.file.Rel == "big.bin" {
+		if row.file.Rel == testBigFile {
 			t.Fatal("deleted file remains in the largest-files view")
 		}
 	}
@@ -711,7 +802,7 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("target still exists: %v", err)
 	}
-	if info, err := os.Stat(auditPath); err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(auditPath); err != nil || runtime.GOOS != windowsOS && info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit log missing or unsafe: info=%v err=%v", info, err)
 	}
 	if _, err := os.Stat(filepath.Join(path, ".dirstat-audit.jsonl")); !os.IsNotExist(err) {
@@ -719,13 +810,218 @@ func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
 	}
 }
 
+func TestManagementReviewRequiresEveryQueuePageToBeVisible(t *testing.T) {
+	root := t.TempDir()
+	m := newModel(New(root, scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	m.width, m.height = 100, 15
+	for i := 0; i < 20; i++ {
+		m.queue = append(m.queue, fsops.Operation{
+			ID: fmt.Sprintf("op-%02d", i), Action: fsops.ActionDelete,
+			Source: filepath.Join(root, fmt.Sprintf("file-%02d", i)),
+		})
+	}
+	m.management = managementReview
+	m.resetQueueReview()
+	firstPage := m.managementSeen
+	if firstPage <= 0 || firstPage >= len(m.queue) || !contains(m.managementBody(), "of 20") {
+		t.Fatalf("initial review page = %d, body=%q", firstPage, m.managementBody())
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	if m.managementSeen != firstPage {
+		t.Fatalf("jumping to the end skipped review coverage: seen=%d want=%d", m.managementSeen, firstPage)
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.management != managementReview || !contains(m.managementError, "review all 20") {
+		t.Fatalf("incomplete review entered confirmation: mode=%v error=%q", m.management, m.managementError)
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyHome})
+	for range len(m.queue) - 1 {
+		m = asModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if m.managementSeen != len(m.queue) {
+		t.Fatalf("sequential review covered %d of %d", m.managementSeen, len(m.queue))
+	}
+	m.managementError = ""
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.management != managementConfirm {
+		t.Fatalf("fully reviewed queue did not enter confirmation: %v", m.management)
+	}
+}
+
+func TestManagementReviewCanRemoveAndReorderItems(t *testing.T) {
+	m := newModel(New(t.TempDir(), scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	m.queue = []fsops.Operation{{ID: "one"}, {ID: "two"}, {ID: "three"}}
+	m.management = managementReview
+	m.resetQueueReview()
+	m = asModel(t, m, key("]"))
+	if got := []string{m.queue[0].ID, m.queue[1].ID, m.queue[2].ID}; !reflect.DeepEqual(got, []string{"two", "one", "three"}) {
+		t.Fatalf("reordered queue = %v", got)
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = asModel(t, m, key("x"))
+	if got := []string{m.queue[0].ID, m.queue[1].ID}; !reflect.DeepEqual(got, []string{"two", "three"}) {
+		t.Fatalf("queue after removal = %v", got)
+	}
+	if !contains(m.managementNote, "review and dry-run state reset") {
+		t.Fatalf("queue edit note = %q", m.managementNote)
+	}
+}
+
+func TestQueueNormalizationDeduplicatesAndRejectsConflicts(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	child := filepath.Join(parent, "child")
+	queue, err := normalizeAndValidateQueue(root, []fsops.Operation{
+		{ID: "child", Action: fsops.ActionDelete, Source: child},
+		{ID: "duplicate-child", Action: fsops.ActionDelete, Source: child},
+		{ID: "parent", Action: fsops.ActionDelete, Source: parent, Recursive: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 1 || queue[0].ID != "parent" {
+		t.Fatalf("normalized nested deletes = %#v", queue)
+	}
+
+	_, err = normalizeAndValidateQueue(root, []fsops.Operation{
+		{ID: "copy-one", Action: fsops.ActionCopy, Source: filepath.Join(root, "one"), Destination: filepath.Join(root, "same")},
+		{ID: "copy-two", Action: fsops.ActionCopy, Source: filepath.Join(root, "two"), Destination: filepath.Join(root, "same")},
+	})
+	if err == nil || !contains(err.Error(), "same destination") {
+		t.Fatalf("destination collision error = %v", err)
+	}
+
+	_, err = normalizeAndValidateQueue(root, []fsops.Operation{
+		{ID: "copy", Action: fsops.ActionCopy, Source: child, Destination: filepath.Join(root, "saved")},
+		{ID: "delete", Action: fsops.ActionDelete, Source: parent, Recursive: true},
+	})
+	if err == nil || !contains(err.Error(), "ancestor") {
+		t.Fatalf("ancestor conflict error = %v", err)
+	}
+
+	queue, err = normalizeAndValidateQueue(root, []fsops.Operation{
+		{ID: "copy-one", Action: fsops.ActionCopy, Source: child, Destination: filepath.Join(root, "one")},
+		{ID: "copy-two", Action: fsops.ActionCopy, Source: child, Destination: filepath.Join(root, "two")},
+	})
+	if err != nil || len(queue) != 2 {
+		t.Fatalf("independent copies rejected: queue=%#v err=%v", queue, err)
+	}
+}
+
+func TestManagementRevalidatesWholeQueueBeforeConfirmation(t *testing.T) {
+	root := t.TempDir()
+	m := newModel(New(root, scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	destination := filepath.Join(root, "same")
+	m.queue = []fsops.Operation{
+		{ID: "one", Action: fsops.ActionCopy, Source: filepath.Join(root, "one"), Destination: destination},
+		{ID: "two", Action: fsops.ActionCopy, Source: filepath.Join(root, "two"), Destination: destination},
+	}
+	m.management = managementReview
+	m.resetQueueReview()
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.management != managementReview || !contains(m.managementError, "same destination") {
+		t.Fatalf("conflicting queue entered confirmation: mode=%v error=%q", m.management, m.managementError)
+	}
+}
+
+func TestManagementDryRunValidatesWithoutMutation(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	target := filepath.Join(path, testBigFile)
+	entry, err := fsinfo.Inspect(target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.queue = []fsops.Operation{{ID: "delete", Action: fsops.ActionDelete, Source: target, Expected: &entry}}
+	m.management = managementReview
+	m.resetQueueReview()
+	updated, cmd := m.Update(key("v"))
+	m = updated.(*model)
+	if cmd == nil || m.management != managementDryRun {
+		t.Fatal("dry-run did not start")
+	}
+	m = asModel(t, m, cmd())
+	if m.management != managementReview || !m.managementDryRun || !contains(m.managementNote, "Dry-run passed") {
+		t.Fatalf("dry-run result: mode=%v passed=%v note=%q error=%q", m.management, m.managementDryRun, m.managementNote, m.managementError)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("dry-run mutated target: %v", err)
+	}
+}
+
+func TestManagementExportsCompleteGuardedPlan(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	target := filepath.Join(path, testBigFile)
+	entry, err := fsinfo.Inspect(target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.queue = []fsops.Operation{{ID: "delete", Action: fsops.ActionDelete, Source: target, Expected: &entry}}
+	m.management = managementReview
+	m.resetQueueReview()
+	m = asModel(t, m, key("e"))
+	if m.management != managementExport {
+		t.Fatalf("management mode = %v, want export", m.management)
+	}
+	destination := filepath.Join(t.TempDir(), "cleanup.jsonl")
+	m = asModel(t, m, key(destination))
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("export did not return a command")
+	}
+	updated, scanCmd := m.Update(cmd())
+	m = updated.(*model)
+	if m.management != managementReview || !contains(m.managementNote, destination) {
+		t.Fatalf("export result: mode=%v note=%q error=%q", m.management, m.managementNote, m.managementError)
+	}
+	if scanCmd == nil {
+		t.Fatal("export inside the filesystem did not request reconciliation")
+	}
+	m.cancelScan()
+	file, err := os.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, readErr := fsops.ReadPlan(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read exported plan: read=%v close=%v", readErr, closeErr)
+	}
+	if plan.Header.Root != path || len(plan.Operations) != 1 || plan.Operations[0].Expected == nil {
+		t.Fatalf("exported plan = %#v", plan)
+	}
+}
+
+func TestQueuedReclaimEstimateDeduplicatesNestedDeletes(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	parent := filepath.Join(path, testSubdir)
+	child := filepath.Join(parent, "c.md")
+	parentNode := m.findNode(parent)
+	if parentNode == nil {
+		t.Fatal("parent node not found")
+	}
+	m.queue = []fsops.Operation{
+		{ID: "child", Action: fsops.ActionDelete, Source: child},
+		{ID: "parent", Action: fsops.ActionDelete, Source: parent},
+	}
+	if got := m.queuedReclaimBytes(); got != parentNode.Alloc {
+		t.Fatalf("reclaim estimate = %d, want parent-only %d", got, parentNode.Alloc)
+	}
+}
+
 func TestSuccessfulDirectoryDeleteUpdatesSubtreeMetadataWithoutRescan(t *testing.T) {
 	path, root := mkTree(t)
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
-	m = asModel(t, m, scanDoneMsg{node: root})
+	m = asModel(t, m, scanDoneMsg{node: root, stats: scan.Stats{Files: root.FileCount, Dirs: root.DirCount + 1, Complete: true}})
 	m.stats.Files, m.stats.Dirs = m.root.FileCount, m.root.DirCount+1
 
-	target := filepath.Join(path, "sub")
+	target := filepath.Join(path, testSubdir)
 	entry, err := fsinfo.Inspect(target, false)
 	if err != nil {
 		t.Fatal(err)
@@ -774,7 +1070,7 @@ func TestF8MarksDirectoryDeleteRecursive(t *testing.T) {
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
 	m = asModel(t, m, scanDoneMsg{node: node})
 	for i := range m.rows {
-		if m.rows[i].node.Name == "sub" {
+		if m.rows[i].node.Name == testSubdir {
 			m.cursor = i
 			break
 		}
@@ -794,7 +1090,7 @@ func TestPartialApplyDropsCompletedOperationsAndUpdatesExactDeletes(t *testing.T
 	path, node := mkTree(t)
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
 	m = asModel(t, m, scanDoneMsg{node: node})
-	target := filepath.Join(path, "big.bin")
+	target := filepath.Join(path, testBigFile)
 	entry, err := fsinfo.Inspect(target, false)
 	if err != nil {
 		t.Fatal(err)
@@ -824,8 +1120,8 @@ func TestPartialApplyDropsCompletedOperationsAndUpdatesExactDeletes(t *testing.T
 	if cmd == nil {
 		t.Fatal("partial mutation did not refresh inspection")
 	}
-	if m.scanning {
-		t.Fatal("an exact successful delete in a partial apply unnecessarily started a rescan")
+	if !m.scanning {
+		t.Fatal("a failed apply did not reconcile possible partial mutations")
 	}
 	if m.findNode(target) != nil || m.root.Apparent != before-removed.Apparent {
 		t.Fatal("successful portion of partial apply was not reflected in the tree")
@@ -836,13 +1132,36 @@ func TestPartialApplyDropsCompletedOperationsAndUpdatesExactDeletes(t *testing.T
 	if m.management != managementResult || !contains(m.managementError, "stale") {
 		t.Fatalf("management=%v error=%q", m.management, m.managementError)
 	}
+	m.cancelScan()
+}
+
+func TestExternalMutationToolsReconcileAfterNonzeroExit(t *testing.T) {
+	for _, kind := range []string{"editor", "shell"} {
+		t.Run(kind, func(t *testing.T) {
+			m := newModel(New(t.TempDir(), scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+			m.scanning = false
+			updated, cmd := m.Update(externalDoneMsg{kind: kind, err: errors.New("exit status 1")})
+			m = updated.(*model)
+			if cmd == nil || !m.scanning || !contains(m.managementError, kind+" failed") {
+				t.Fatalf("%s completion: command=%t scanning=%t error=%q", kind, cmd != nil, m.scanning, m.managementError)
+			}
+			m.cancelScan()
+		})
+	}
+	m := newModel(New(t.TempDir(), scope.New(), tree.SizeOnDisk, 0, Options{DisableAudit: true}))
+	m.scanning = false
+	updated, cmd := m.Update(externalDoneMsg{kind: "pager", err: errors.New("exit status 1")})
+	m = updated.(*model)
+	if cmd != nil || m.scanning || !contains(m.managementError, "pager failed") {
+		t.Fatalf("pager completion: command=%t scanning=%t error=%q", cmd != nil, m.scanning, m.managementError)
+	}
 }
 
 func TestSuccessfulNonDeleteApplyStartsReconciliationScan(t *testing.T) {
 	path, node := mkTree(t)
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
 	m = asModel(t, m, scanDoneMsg{node: node})
-	m.queue = []fsops.Operation{{ID: "copy", Action: fsops.ActionCopy, Source: filepath.Join(path, "a.go")}}
+	m.queue = []fsops.Operation{{ID: "copy", Action: fsops.ActionCopy, Source: filepath.Join(path, testGoFile)}}
 	m.management = managementApplying
 
 	updated, cmd := m.Update(appliedMsg{results: []fsops.Result{{OperationID: "copy", Action: fsops.ActionCopy, Status: "ok"}}})
@@ -858,7 +1177,7 @@ func TestF5QueuesCopyDestinationWithoutMutation(t *testing.T) {
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
 	m = asModel(t, m, scanDoneMsg{node: node})
 	for i := range m.rows {
-		if m.rows[i].node.Name == "a.go" {
+		if m.rows[i].node.Name == testGoFile {
 			m.cursor = i
 			break
 		}
@@ -887,7 +1206,7 @@ func TestF6AndF7QueueMoveAndMkdir(t *testing.T) {
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
 	m = asModel(t, m, scanDoneMsg{node: node})
 	for i := range m.rows {
-		if m.rows[i].node.Name == "a.go" {
+		if m.rows[i].node.Name == testGoFile {
 			m.cursor = i
 			break
 		}
@@ -936,6 +1255,13 @@ func TestReadOnlyBlocksManagementAndEditor(t *testing.T) {
 	}
 	if !contains(m.headerView(), "read-only") {
 		t.Fatal("read-only mode is not visible")
+	}
+	m.queue = []fsops.Operation{{ID: "delete", Action: fsops.ActionDelete, Source: filepath.Join(path, testBigFile)}}
+	m.management = managementReview
+	m.resetQueueReview()
+	m = asModel(t, m, key("e"))
+	if m.management != managementReview || !contains(m.managementError, "plan export is disabled") {
+		t.Fatalf("read-only export was not blocked: mode=%v error=%q", m.management, m.managementError)
 	}
 }
 

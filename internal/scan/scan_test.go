@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	historypkg "github.com/phillipod/go-dirstat/internal/history"
+	"github.com/phillipod/go-dirstat/internal/index"
+	querypkg "github.com/phillipod/go-dirstat/internal/query"
 	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
@@ -173,7 +176,7 @@ func TestScanFollowSymlinkBackToRootOnce(t *testing.T) {
 	}
 }
 
-func TestDirectoryLoopFallbackUsesCanonicalPath(t *testing.T) {
+func TestDirectoryIdentityFallbackUsesCanonicalPath(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "target")
 	if err := os.Mkdir(target, 0o755); err != nil {
@@ -187,28 +190,12 @@ func TestDirectoryLoopFallbackUsesCanonicalPath(t *testing.T) {
 	if err := os.Symlink(target, second); err != nil {
 		t.Skipf("symlinks not supported: %v", err)
 	}
-	s := &scanner{
-		loopMu:       &sync.Mutex{},
-		visited:      make(map[devIno]struct{}),
-		visitedPaths: make(map[string]struct{}),
-	}
-	info := noIdentityFileInfo{}
-	if s.seenDirectory(first, info) {
-		t.Fatal("first canonical directory was already marked visited")
-	}
-	if !s.seenDirectory(second, info) {
-		t.Fatal("second alias to the same canonical directory was not detected")
+	firstKey := fallbackDirectoryIdentity(first)
+	secondKey := fallbackDirectoryIdentity(second)
+	if firstKey.path == "" || firstKey != secondKey {
+		t.Fatalf("fallback identities differ: first=%+v second=%+v", firstKey, secondKey)
 	}
 }
-
-type noIdentityFileInfo struct{}
-
-func (noIdentityFileInfo) Name() string       { return "directory" }
-func (noIdentityFileInfo) Size() int64        { return 0 }
-func (noIdentityFileInfo) Mode() os.FileMode  { return os.ModeDir }
-func (noIdentityFileInfo) ModTime() time.Time { return time.Time{} }
-func (noIdentityFileInfo) IsDir() bool        { return true }
-func (noIdentityFileInfo) Sys() any           { return nil }
 
 func TestScanFollowSymlinkCannotBypassExcludedTarget(t *testing.T) {
 	base := t.TempDir()
@@ -411,6 +398,32 @@ func TestStatErrorDoesNotInflateFileCount(t *testing.T) {
 	}
 }
 
+func TestReadDirErrorRetainsKnownDirectoryMetadata(t *testing.T) {
+	path := t.TempDir()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	node := &tree.Node{Name: filepath.Base(path), IsDir: true}
+	s := &scanner{
+		ctx: context.Background(), opts: DefaultOptions(), sem: make(chan struct{}, 1),
+	}
+	lt := &liveTree{root: node}
+	s.scanDir(path, "", info, devOfPath(path, info), "", 0, node, nil, lt)
+	if node.Err == nil {
+		t.Fatal("removed directory did not produce a ReadDir error")
+	}
+	if node.Alloc != allocBytes(info) || !node.ModTime.Equal(info.ModTime()) {
+		t.Fatalf("known metadata was discarded: node=%+v info=%+v", node, info)
+	}
+	if s.errors != 1 {
+		t.Fatalf("scan errors = %d, want 1", s.errors)
+	}
+}
+
 // TestScanConcurrencySanity re-scans the repo itself under the race detector
 // implicitly (go test -race) to shake out goroutine/data-race bugs in the
 // aggregation step on a non-trivial tree.
@@ -526,8 +539,8 @@ func TestScanHardlinkDedup(t *testing.T) {
 	root := t.TempDir()
 	orig := filepath.Join(root, "orig.bin")
 	writeFile(t, orig, 1000)
-	copy_ := filepath.Join(root, "copy.bin")
-	if err := os.Link(orig, copy_); err != nil {
+	copyPath := filepath.Join(root, "copy.bin")
+	if err := os.Link(orig, copyPath); err != nil {
 		t.Skipf("hardlinks not supported: %v", err)
 	}
 	writeFile(t, filepath.Join(root, "other.bin"), 500) // a separate inode
@@ -606,6 +619,140 @@ func TestScanFollowedFileAliasesAreDeduplicatedDeterministically(t *testing.T) {
 			t.Errorf("duplicate %s = %+v, want zero-size hardlink marker", name, duplicate)
 		}
 	}
+}
+
+func TestFollowedDirectoryAliasesAreStableAcrossConcurrentScans(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	target := filepath.Join(base, "shared-target")
+	writeFile(t, filepath.Join(target, "nested", "payload.bin"), 257)
+
+	const branchCount = 64
+	for i := branchCount - 1; i >= 0; i-- {
+		branch := filepath.Join(root, fmt.Sprintf("branch-%02d", i))
+		if err := os.MkdirAll(branch, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(branch, "shared")); err != nil {
+			t.Skipf("directory symlinks not supported: %v", err)
+		}
+	}
+
+	opts := Options{
+		Policy:      scope.New(scope.WithFollowSymlinks(true)),
+		Concurrency: 32,
+	}
+	var (
+		wantTreePaths  string
+		wantQueryPaths string
+		previous       *index.Snapshot
+	)
+	for attempt := 0; attempt < 30; attempt++ {
+		n, stats, err := Scan(context.Background(), root, opts)
+		if err != nil {
+			t.Fatalf("attempt %d scan: %v", attempt, err)
+		}
+		if stats.Files != 1 || stats.Dirs != branchCount+3 || n.Apparent != 257 || n.FileCount != 1 || n.DirCount != stats.Dirs-1 {
+			t.Fatalf("attempt %d double-counted aliases: tree=%+v stats=%+v", attempt, n, stats)
+		}
+		branches := make(map[string]*tree.Node, len(n.Children))
+		for _, child := range n.Children {
+			branches[child.Name] = child
+		}
+		owner, duplicate := branches["branch-00"], branches["branch-01"]
+		if owner == nil || owner.Apparent != 257 || owner.FileCount != 1 || owner.DirCount != 2 {
+			t.Fatalf("attempt %d owner aggregates = %+v", attempt, owner)
+		}
+		if duplicate == nil || duplicate.Apparent != 0 || duplicate.FileCount != 0 || duplicate.DirCount != 0 {
+			t.Fatalf("attempt %d duplicate aggregates = %+v", attempt, duplicate)
+		}
+
+		treePaths := strings.Join(relativeTreePaths(n), "\n")
+		records, err := querypkg.Build(n, root, querypkg.Options{})
+		if err != nil {
+			t.Fatalf("attempt %d query: %v", attempt, err)
+		}
+		queryPaths := strings.Join(relativeQueryPaths(records), "\n")
+		if attempt == 0 {
+			wantTreePaths = treePaths
+			wantQueryPaths = queryPaths
+			if !strings.Contains("\n"+treePaths+"\n", "\nbranch-00/shared/nested/payload.bin\n") {
+				t.Fatalf("lexicographically first alias is not the owner:\n%s", treePaths)
+			}
+		} else {
+			if treePaths != wantTreePaths {
+				t.Fatalf("attempt %d tree paths changed:\nwant:\n%s\ngot:\n%s", attempt, wantTreePaths, treePaths)
+			}
+			if queryPaths != wantQueryPaths {
+				t.Fatalf("attempt %d query paths changed:\nwant:\n%s\ngot:\n%s", attempt, wantQueryPaths, queryPaths)
+			}
+		}
+
+		current := index.FromTree(n, "followed-directory-aliases", stats.RootFS, stats.Files, stats.Dirs, stats.Errors, stats.Complete, time.Now())
+		current.Root = root
+		if previous != nil {
+			deltas, err := historypkg.Compare(previous, current)
+			if err != nil {
+				t.Fatalf("attempt %d history compare: %v", attempt, err)
+			}
+			if len(deltas) != 0 {
+				t.Fatalf("attempt %d unchanged scan produced history deltas: %#v", attempt, deltas)
+			}
+		}
+		previous = current
+	}
+}
+
+func TestFollowedDirectoryCrossLinksDoNotCreateCanonicalCycle(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	writeFile(t, filepath.Join(a, "a.bin"), 11)
+	writeFile(t, filepath.Join(b, "b.bin"), 13)
+	if err := os.Symlink(b, filepath.Join(a, "z-to-b")); err != nil {
+		t.Skipf("directory symlinks not supported: %v", err)
+	}
+	if err := os.Symlink(a, filepath.Join(b, "y-to-a")); err != nil {
+		t.Skipf("directory symlinks not supported: %v", err)
+	}
+
+	n, stats, err := Scan(context.Background(), root, Options{
+		Policy: scope.New(scope.WithFollowSymlinks(true)), Concurrency: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Apparent != 24 || n.FileCount != 2 || n.DirCount != 2 || stats.Dirs != 3 {
+		t.Fatalf("cross-linked totals = tree %+v / stats %+v", n, stats)
+	}
+	paths := "\n" + strings.Join(relativeTreePaths(n), "\n") + "\n"
+	for _, want := range []string{"a", "a/a.bin", "a/z-to-b", "a/z-to-b/b.bin"} {
+		if !strings.Contains(paths, "\n"+want+"\n") {
+			t.Errorf("canonical tree missing %q:\n%s", want, paths)
+		}
+	}
+	for _, duplicate := range []string{"b", "a/z-to-b/y-to-a"} {
+		if strings.Contains(paths, "\n"+duplicate+"\n") {
+			t.Errorf("canonical tree retained duplicate/loop %q:\n%s", duplicate, paths)
+		}
+	}
+}
+
+func relativeTreePaths(root *tree.Node) []string {
+	paths := make([]string, 0, root.FileCount+root.DirCount+1)
+	root.Walk(func(node *tree.Node) bool {
+		paths = append(paths, filepath.ToSlash(node.Path()))
+		return true
+	})
+	return paths
+}
+
+func relativeQueryPaths(records []querypkg.Record) []string {
+	paths := make([]string, len(records))
+	for i, record := range records {
+		paths[i] = record.Relative
+	}
+	return paths
 }
 
 func TestScanCrossDirectoryHardlinkOwnerIsDeterministic(t *testing.T) {

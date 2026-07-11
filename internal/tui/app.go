@@ -34,6 +34,16 @@ type Options struct {
 	// explicit opt-out for environments that do not permit audit persistence.
 	AuditPath    string
 	DisableAudit bool
+	// TargetAvailableBytes is the desired caller-available capacity. Queue caps
+	// are safety policy, not mutation implementation limits.
+	TargetAvailableBytes uint64
+	QueueMaxOperations   int
+	QueueMaxReclaimBytes int64
+	HistoryMax           int
+	CacheMaxBytes        int64
+	CacheMaxAge          time.Duration
+	HistoryMaxBytes      int64
+	HistoryMaxAge        time.Duration
 }
 
 // App is the configured, runnable TUI. Build one with New, then call Run.
@@ -43,6 +53,11 @@ type App struct {
 	sizeMode tree.SizeMode
 	jobs     int
 	opts     Options
+
+	// Package-internal seams keep lifecycle and outcome integration tests
+	// deterministic without weakening the public API or production defaults.
+	programOptions []tea.ProgramOption
+	applyPlan      applyPlanFunc
 }
 
 // New returns a configured App.
@@ -66,7 +81,9 @@ func (a *App) Run(parent context.Context) error {
 	// Mouse tracking is intentionally not enabled until the model implements
 	// click and wheel events; enabling terminal mouse reporting without handlers
 	// steals normal selection/scroll behavior from the user's terminal.
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	programOptions := []tea.ProgramOption{tea.WithAltScreen(), tea.WithContext(ctx)}
+	programOptions = append(programOptions, a.programOptions...)
+	p := tea.NewProgram(m, programOptions...)
 	m.program = p
 	defer m.cancelScan()
 	_, err := p.Run()

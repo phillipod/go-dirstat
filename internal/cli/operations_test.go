@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/tar"
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -107,6 +108,27 @@ func TestPlanCommandCoversEveryAction(t *testing.T) {
 	}
 }
 
+func TestPlanCommandRecordsDestinationAbsenceAndIdentity(t *testing.T) {
+	root := t.TempDir()
+	source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	absentPlan := readCLIPlan(t, executeOperationCLI(t, nil, "plan", "--root", root, "copy", "source", "destination"))
+	absent := absentPlan.Operations[0].ExpectedDestination
+	if absent == nil || absent.Exists || absent.Entry != nil || absent.Path != destination {
+		t.Fatalf("absent destination guard = %#v", absent)
+	}
+	if err := os.WriteFile(destination, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	presentPlan := readCLIPlan(t, executeOperationCLI(t, nil, "plan", "--root", root, "copy", "source", "destination"))
+	present := presentPlan.Operations[0].ExpectedDestination
+	if present == nil || !present.Exists || present.Entry == nil || present.Entry.Path != destination || present.Entry.Size != 3 {
+		t.Fatalf("present destination guard = %#v", present)
+	}
+}
+
 func TestPlanCommandRejectsUnsafeOrInvalidRequests(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "source"), []byte("x"), 0o600); err != nil {
@@ -155,7 +177,7 @@ func TestPlanCommandWritesPrivateFileWithoutOverwriting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != windowsOS && info.Mode().Perm() != 0o600 {
 		t.Fatalf("plan mode = %o", info.Mode().Perm())
 	}
 	cmd = New()
@@ -194,6 +216,42 @@ func TestApplyRequiresYesAndDryRunEmitsResult(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsStrictJSONLBeforeMutation(t *testing.T) {
+	configureCLIState(t)
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	header := fmt.Sprintf(`{"type":"plan","version":%d,"root":%q}`, fsops.PlanVersion, root)
+	operation := fmt.Sprintf(`{"type":"operation","id":"touch","action":"touch","source":%q,"unknown":true}`, target)
+	cmd := New()
+	cmd.SetArgs([]string{"apply", "--yes", "--no-audit", "-"})
+	cmd.SetIn(strings.NewReader(header + "\n" + operation + "\n"))
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), `unknown field "unknown"`) {
+		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("strict-plan rejection mutated target: %v", err)
+	}
+}
+
+func TestApplyHelpDocumentsStrictCompletePlanContract(t *testing.T) {
+	cmd := New()
+	cmd.SetArgs([]string{"apply", "--help"})
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	help := out.String()
+	for _, want := range []string{"strict JSONL", "one object per physical line", "64 MiB", "before any mutation"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
 func TestApplyMutatesAuditsAndSupportsNoAudit(t *testing.T) {
 	state := configureCLIState(t)
 	root := t.TempDir()
@@ -211,7 +269,7 @@ func TestApplyMutatesAuditsAndSupportsNoAudit(t *testing.T) {
 		t.Fatalf("source remains: %v", err)
 	}
 	audit := filepath.Join(state, "dirstat", "operations.jsonl")
-	if info, err := os.Stat(audit); err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(audit); err != nil || runtime.GOOS != windowsOS && info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit info = %v, %v", info, err)
 	}
 

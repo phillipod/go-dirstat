@@ -20,7 +20,7 @@ import (
 func TestExactDeletePersistsPatchedCache(t *testing.T) {
 	isolateUserCache(t)
 	path, root := mkTree(t)
-	stats := scan.Stats{Files: root.FileCount, Dirs: root.DirCount + 1}
+	stats := scan.Stats{Files: root.FileCount, Dirs: root.DirCount + 1, Complete: true}
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{UseCache: true, DisableAudit: true}))
 	if m.store == nil {
 		t.Fatalf("cache store is unavailable: %v", m.cacheErr)
@@ -28,7 +28,7 @@ func TestExactDeletePersistsPatchedCache(t *testing.T) {
 	updated, _ := m.Update(scanDoneMsg{node: root, stats: stats})
 	m = updated.(*model)
 
-	target := filepath.Join(path, "big.bin")
+	target := filepath.Join(path, testBigFile)
 	entry, err := fsinfo.Inspect(target, false)
 	if err != nil {
 		t.Fatal(err)
@@ -49,18 +49,24 @@ func TestExactDeletePersistsPatchedCache(t *testing.T) {
 	if !ok {
 		t.Fatal("exact cached delete did not schedule a cache save batch")
 	}
-	saved := false
+	saved, pressureRefreshed := false, false
 	for _, batched := range batch {
 		msg := batched()
-		if result, ok := msg.(cacheSavedMsg); ok {
+		switch result := msg.(type) {
+		case cacheSavedMsg:
 			saved = true
 			if result.err != nil {
 				t.Fatalf("save patched cache: %v", result.err)
 			}
+		case pressureLoadedMsg:
+			pressureRefreshed = true
 		}
 	}
 	if !saved {
 		t.Fatal("exact delete batch omitted the cache save")
+	}
+	if !pressureRefreshed {
+		t.Fatal("exact delete batch omitted the volume-pressure refresh")
 	}
 
 	snapshot, err := m.store.Load(m.rootAbs, m.fingerprint)
@@ -70,9 +76,16 @@ func TestExactDeletePersistsPatchedCache(t *testing.T) {
 	if snapshot.Files != stats.Files-1 {
 		t.Fatalf("cached files = %d, want %d", snapshot.Files, stats.Files-1)
 	}
+	live, _, err := scan.Scan(context.Background(), path, scan.WithPolicy(scope.New()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Nodes[0].Alloc != live.Alloc {
+		t.Fatalf("cached allocated bytes = %d, live rescan = %d", snapshot.Nodes[0].Alloc, live.Alloc)
+	}
 	found := false
 	snapshot.ToTree().Walk(func(node *tree.Node) bool {
-		if node.Path() == "big.bin" {
+		if node.Path() == testBigFile {
 			found = true
 		}
 		return true
@@ -143,7 +156,7 @@ func TestApplyInterruptsOldScanAndReconcilesFromPatchedTree(t *testing.T) {
 		t.Fatalf("paused scan state: scanning=%t needs_scan=%t generation=%d", m.scanning, m.applyNeedsScan, m.scanGeneration)
 	}
 
-	target := filepath.Join(path, "a.go")
+	target := filepath.Join(path, testGoFile)
 	entry, err := fsinfo.Inspect(target, false)
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +183,7 @@ func TestDeleteInvalidatesInspectionStartedBeforeMutation(t *testing.T) {
 	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
 	m = asModel(t, m, scanDoneMsg{node: root})
 	for i, row := range m.rows {
-		if row.node.Name == "a.go" {
+		if row.node.Name == testGoFile {
 			m.cursor = i
 			break
 		}
@@ -205,7 +218,7 @@ func isolateUserCache(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	switch runtime.GOOS {
-	case "windows":
+	case windowsOS:
 		t.Setenv("LocalAppData", dir)
 	case "darwin":
 		t.Setenv("HOME", dir)

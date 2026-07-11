@@ -15,56 +15,164 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # Release verification and packaging must use the exact pinned compiler.
+  GOTOOLCHAIN: local
 
 jobs:
   validate:
-    name: validate release tag
+    name: validate tagged source
     runs-on: ubuntu-latest
-    steps:
-      - name: Validate tag format
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tag must look like v1.2.3 or v1.2.3-rc.1; got: $RELEASE_TAG" >&2
-            exit 1
-          fi
-
-  verify:
-    name: verify release source
-    needs: validate
-    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      build_date: ${{ steps.source.outputs.build_date }}
     steps:
       - name: Check out release ref
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Validate tag and source identity
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/validate-release-tag.sh "$RELEASE_TAG"
+          commit="$(git rev-parse HEAD)"
+          tagged_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$commit" != "$tagged_commit" ]]; then
+            echo "checked-out commit $commit does not match $RELEASE_TAG ($tagged_commit)" >&2
+            exit 1
+          fi
+          build_date="$(git show -s --format=%cI HEAD)"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+          printf 'build_date=%s\n' "$build_date" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: native tests / ${{ matrix.runner }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-latest
+          - windows-latest
+          - windows-11-arm
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          go-version-file: go.mod
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
           cache: true
 
       - name: Verify modules
         run: go mod verify
 
-      - name: Run release tests
+      - name: Run tests
         run: go test ./... -count=1
 
-      - name: Run release vet
+      - name: Run vet
         run: go vet ./...
+
+      - name: Build native CLI
+        run: go build -trimpath ./cmd/dirstat
+
+  lint:
+    name: full golangci-lint policy
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run golangci-lint, including test code
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.11.4
+          args: --timeout=5m
+
+      - name: Verify lint configuration and formatting
+        run: |
+          golangci-lint config verify
+          golangci-lint fmt --diff
+
+  race:
+    name: race detector
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run race-enabled tests
+        run: go test -race ./... -count=1
+
+  govulncheck:
+    name: govulncheck release source
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Install govulncheck
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Reject reachable vulnerabilities
+        run: '"$RUNNER_TEMP/bin/govulncheck" ./...'
 
   build:
     name: package / ${{ matrix.os }}-${{ matrix.arch }}
-    needs: verify
+    needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -73,98 +181,278 @@ jobs:
             arch: amd64
             goos: linux
             goarch: amd64
-            suffix: ''
             archive: tar.gz
           - os: linux
             arch: arm64
             goos: linux
             goarch: arm64
-            suffix: ''
             archive: tar.gz
           - os: darwin
             arch: amd64
             goos: darwin
             goarch: amd64
-            suffix: ''
             archive: tar.gz
           - os: darwin
             arch: arm64
             goos: darwin
             goarch: arm64
-            suffix: ''
             archive: tar.gz
           - os: windows
             arch: amd64
             goos: windows
             goarch: amd64
-            suffix: .exe
             archive: zip
           - os: windows
             arch: arm64
             goos: windows
             goarch: arm64
-            suffix: .exe
             archive: zip
     steps:
       - name: Check out release ref
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.5'
           cache: true
 
-      - name: Build and package artifact
+      - name: Build reproducible release archive
         shell: bash
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          set -euo pipefail
-          package_name="dirstat-${RELEASE_TAG}-${{ matrix.os }}-${{ matrix.arch }}"
-          binary_name="dirstat${{ matrix.suffix }}"
-          commit="$(git rev-parse HEAD)"
-          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          mkdir -p "package/$package_name" dist
-          go build -trimpath \
-            -ldflags "-s -w -X github.com/phillipod/go-dirstat/internal/version.Version=$RELEASE_TAG -X github.com/phillipod/go-dirstat/internal/version.Commit=$commit -X github.com/phillipod/go-dirstat/internal/version.BuildDate=$build_date" \
-            -o "package/$package_name/$binary_name" ./cmd/dirstat
-          cp LICENSE README.md "package/$package_name/"
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            (cd package && zip -q -r "../dist/$package_name.zip" "$package_name")
-          else
-            tar -C package -czf "dist/$package_name.tar.gz" "$package_name"
-          fi
+        run: >-
+          bash .github/scripts/package-release.sh
+          "$RELEASE_TAG"
+          "${{ matrix.os }}"
+          "${{ matrix.arch }}"
+          "${{ matrix.goos }}"
+          "${{ matrix.goarch }}"
+          "${{ matrix.archive }}"
+          dist
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.os }}-${{ matrix.arch }}
-          path: dist/*
+          path: dist/dirstat-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}
           if-no-files-found: error
           retention-days: 30
 
+  artifact-smoke:
+    name: native archive smoke / ${{ matrix.os }}-${{ matrix.arch }}
+    needs:
+      - validate
+      - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - runner: macos-15-intel
+            os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - runner: macos-latest
+            os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - runner: windows-latest
+            os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            archive: zip
+          - runner: windows-11-arm
+            os: windows
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            archive: zip
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Download target archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist
+
+      - name: Verify contents, metadata, and native behavior
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+          SOURCE_BUILD_DATE: ${{ needs.validate.outputs.build_date }}
+        run: >-
+          bash .github/scripts/verify-release-artifact.sh
+          "$RELEASE_TAG"
+          "${{ matrix.os }}"
+          "${{ matrix.arch }}"
+          "${{ matrix.goos }}"
+          "${{ matrix.goarch }}"
+          "dist/dirstat-${RELEASE_TAG}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}"
+          "$SOURCE_COMMIT"
+          "$SOURCE_BUILD_DATE"
+          true
+
+  supply-chain:
+    name: checksums, SBOM, and signed attestations
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Download all release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*-*
+          path: dist/artifacts
+          merge-multiple: true
+
+      - name: Prepare metadata directory
+        shell: bash
+        run: mkdir -p dist/metadata
+
+      - name: Generate SPDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/metadata/dirstat-${{ env.RELEASE_TAG }}.spdx.json
+          syft-version: v1.44.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Create and self-check release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist/artifacts -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+          mkdir -p dist/checksum-input
+          cp dist/artifacts/* dist/checksum-input/
+          cp dist/metadata/*.spdx.json dist/checksum-input/
+          (cd dist/checksum-input && sha256sum ./* | LC_ALL=C sort > ../metadata/SHA256SUMS)
+          (cd dist/checksum-input && sha256sum -c ../metadata/SHA256SUMS)
+          rm -rf dist/checksum-input
+
+      - name: Sign artifact provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/artifacts/*
+          create-storage-record: false
+
+      - name: Sign artifact SBOM attestations
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/artifacts/*
+          sbom-path: dist/metadata/dirstat-${{ env.RELEASE_TAG }}.spdx.json
+          create-storage-record: false
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-metadata
+          path: dist/metadata/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release-gate:
+    name: all release evidence passed
+    needs:
+      - validate
+      - test
+      - lint
+      - race
+      - govulncheck
+      - build
+      - artifact-smoke
+      - supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*-*
+          path: dist/bundle
+          merge-multiple: true
+
+      - name: Download release metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-metadata
+          path: dist/bundle
+
+      - name: Verify complete publish bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist/bundle -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+          test -f "dist/bundle/dirstat-${RELEASE_TAG}.spdx.json"
+          (cd dist/bundle && sha256sum -c SHA256SUMS)
+
   publish:
     name: publish GitHub release
-    needs: build
+    needs: release-gate
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v8
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: release-*
-          path: dist
+          pattern: release-*-*
+          path: dist/bundle
           merge-multiple: true
 
-      - name: Create checksums
+      - name: Download release metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-metadata
+          path: dist/bundle
+
+      - name: Recheck release bundle
         shell: bash
-        run: sha256sum dist/* | sort > dist/SHA256SUMS
+        run: |
+          set -euo pipefail
+          test "$(find dist/bundle -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+          (cd dist/bundle && sha256sum -c SHA256SUMS)
 
       - name: Publish release and assets
         shell: bash
@@ -172,7 +460,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" dist/* \
+          gh release create "$RELEASE_TAG" dist/bundle/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$RELEASE_TAG" \

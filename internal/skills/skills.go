@@ -181,6 +181,7 @@ Use **dirstat** to establish disk pressure, locate specific candidates, and make
        dirstat diagnose --format=json /srv
 
    Use **diagnose** when host-level evidence is needed, especially to identify open-but-deleted files that consume space without appearing in the directory tree.
+   In JSON, use **caller_pressure_percent** for ordinary-user pressure and **physical_used_percent** for allocated blocks. Treat an incomplete open-deleted total as an observed lower bound; inspect its coverage before making a reclaim claim.
 
 2. Find where space is concentrated. The default command shows a hierarchy; extensions groups space by file type:
 
@@ -199,12 +200,16 @@ Use **dirstat** to establish disk pressure, locate specific candidates, and make
        dirstat query --kind=file --path-regexp='\.tmp$' --format=nul /srv
 
    Add **--metadata** when owner, group, mode, link count, or stable identity belongs in the candidate evidence.
+   Use **--limit** for a bounded sorted candidate set. Use **--stream** only when sort order is unnecessary and a low-memory TSV/JSONL/NUL pipeline is more important.
 
 4. Verify a candidate before proposing it. **inspect** reports type, size, allocation, ownership, links, and time; **--content** reads only a bounded preview. **history growth** records a scan and compares it with the prior one:
 
        dirstat inspect --format=json /srv/archive/old.log
        dirstat inspect --content --limit=65536 /srv/archive/old.log
        dirstat history growth /srv
+       dirstat history growth --leaf-only --limit=50 --format=json /srv
+
+   Default history rows include both changed ancestors and descendants and must not be summed. Use **--leaf-only** when additive cleanup evidence is required.
 
 ## Evidence to report
 

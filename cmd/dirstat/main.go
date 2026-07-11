@@ -18,6 +18,6 @@ func main() {
 
 	if err := cli.New().ExecuteContext(ctx); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "dirstat:", err)
-		os.Exit(1)
+		os.Exit(cli.ExitCode(err))
 	}
 }

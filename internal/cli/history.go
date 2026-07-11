@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	appconfig "github.com/phillipod/go-dirstat/internal/config"
 	"github.com/phillipod/go-dirstat/internal/format"
 	"github.com/phillipod/go-dirstat/internal/history"
 	"github.com/phillipod/go-dirstat/internal/index"
@@ -24,7 +26,7 @@ func newHistoryCommand(cfg *Config) *cobra.Command {
 		Short: "Record scans and report disk-usage growth",
 		Args:  cobra.NoArgs,
 	}
-	cmd.PersistentFlags().StringVar(&storeDir, "store", "", "history store directory (default: user cache directory)")
+	cmd.PersistentFlags().StringVar(&storeDir, "store", "", "history store directory (default: user state directory)")
 	cmd.AddCommand(newHistoryListCommand(cfg, &storeDir))
 	cmd.AddCommand(newHistoryGrowthCommand(cfg, &storeDir))
 	return cmd
@@ -41,16 +43,19 @@ func newHistoryListCommand(cfg *Config, storeDir *string) *cobra.Command {
 			if output != outputFormatText && output != outputFormatJSON {
 				return fmt.Errorf("invalid --format %q: expected text or json", output)
 			}
-			root, policy, fingerprint, err := historyKey(cfg, firstPath(args))
+			maxRecords, statePolicy, err := configuredHistoryPolicy()
 			if err != nil {
 				return err
 			}
-			_ = policy
-			store, err := openHistoryStore(*storeDir)
+			store, err := openHistoryStore(*storeDir, maxRecords, statePolicy, false)
 			if err != nil {
 				return err
 			}
-			records, err := store.List(root, fingerprint)
+			root, _, fingerprint, _, err := historyKey(cfg, firstPath(args), store.Dir())
+			if err != nil {
+				return err
+			}
+			records, err := store.ListContext(cmd.Context(), root, fingerprint)
 			if err != nil {
 				return err
 			}
@@ -82,6 +87,9 @@ func newHistoryListCommand(cfg *Config, storeDir *string) *cobra.Command {
 func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 	var output string
 	var raw bool
+	var kind string
+	var maxDepth, limit int
+	var leafOnly bool
 	cmd := &cobra.Command{
 		Use:   "growth [path]",
 		Short: "Record a fresh scan and compare it with the previous snapshot",
@@ -90,15 +98,32 @@ func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 			if output != outputFormatText && output != outputFormatJSON {
 				return fmt.Errorf("invalid --format %q: expected text or json", output)
 			}
-			root, policy, fingerprint, err := historyKey(cfg, firstPath(args))
+			deltaFilter, err := parseHistoryDeltaFilter(kind, maxDepth, limit, leafOnly)
 			if err != nil {
 				return err
 			}
-			store, err := openHistoryStore(*storeDir)
+			maxRecords, statePolicy, err := configuredHistoryPolicy()
 			if err != nil {
 				return err
 			}
-			previous, previousErr := store.Previous(root, fingerprint, time.Time{})
+			store, err := openHistoryStore(*storeDir, maxRecords, statePolicy, false)
+			if err != nil {
+				return err
+			}
+			root, policy, fingerprint, containedStore, err := historyKey(cfg, firstPath(args), store.Dir())
+			if err != nil {
+				return err
+			}
+			store, err = openHistoryStore(store.Dir(), maxRecords, statePolicy, true)
+			if err != nil {
+				return err
+			}
+			if containedStore && *storeDir != "" {
+				if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "dirstat: excluding history store %s from scan\n", format.SafeText(store.Dir())); err != nil {
+					return fmt.Errorf("write history-store warning: %w", err)
+				}
+			}
+			previous, previousErr := store.PreviousContext(cmd.Context(), root, fingerprint, time.Time{})
 			if previousErr != nil && !errors.Is(previousErr, fs.ErrNotExist) {
 				return previousErr
 			}
@@ -106,9 +131,12 @@ func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("scan history root %q: %w", root, err)
 			}
-			current := index.FromTree(node, fingerprint, stats.RootFS, stats.Files, stats.Dirs, stats.Errors, time.Now().UTC())
+			if err := acceptScan(cmd, root, stats, false); err != nil {
+				return fmt.Errorf("history refuses to record partial data: %w", err)
+			}
+			current := index.FromTree(node, fingerprint, stats.RootFS, stats.Files, stats.Dirs, stats.Errors, stats.Complete, time.Now().UTC())
 			current.Root = root
-			record, err := store.RecordSnapshot(current)
+			record, err := store.RecordSnapshotContext(cmd.Context(), current)
 			if err != nil {
 				return err
 			}
@@ -116,6 +144,10 @@ func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 			deltas := make([]history.Delta, 0)
 			if !baseline {
 				deltas, err = history.Compare(previous, current)
+				if err != nil {
+					return err
+				}
+				deltas, err = history.FilterDeltas(deltas, root, deltaFilter)
 				if err != nil {
 					return err
 				}
@@ -147,26 +179,117 @@ func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&output, "format", "text", "output format: text|json")
 	cmd.Flags().BoolVar(&raw, "bytes", false, "print raw byte deltas instead of human sizes")
+	cmd.Flags().StringVar(&kind, "kind", string(history.DeltaKindAll), "include changes for all, file, or directory paths")
+	cmd.Flags().IntVar(&maxDepth, "depth", -1, "maximum path depth relative to the root (-1 = unlimited)")
+	cmd.Flags().IntVar(&limit, "limit", 0, "maximum changes to report (0 = unlimited)")
+	cmd.Flags().BoolVar(&leafOnly, "leaf-only", false, "suppress changed paths that have changed descendants")
 	return cmd
 }
 
-func historyKey(cfg *Config, path string) (string, scope.Policy, string, error) {
-	policy, err := cfg.policy()
-	if err != nil {
-		return "", scope.Policy{}, "", err
+func parseHistoryDeltaFilter(kind string, maxDepth, limit int, leafOnly bool) (history.DeltaFilter, error) {
+	filter := history.DeltaFilter{
+		Kind:     history.DeltaKind(strings.ToLower(strings.TrimSpace(kind))),
+		MaxDepth: maxDepth, Limit: limit, LeafOnly: leafOnly,
 	}
-	root, err := absolutePath(path)
-	if err != nil {
-		return "", scope.Policy{}, "", err
+	if filter.Kind != history.DeltaKindAll && filter.Kind != history.DeltaKindFile && filter.Kind != history.DeltaKindDirectory {
+		return history.DeltaFilter{}, fmt.Errorf("invalid --kind %q: expected all, file, or directory", kind)
 	}
-	return root, policy, index.Fingerprint(root, policy), nil
+	if maxDepth < -1 {
+		return history.DeltaFilter{}, fmt.Errorf("--depth must be -1 or greater")
+	}
+	if limit < 0 {
+		return history.DeltaFilter{}, fmt.Errorf("--limit must be zero or greater")
+	}
+	return filter, nil
 }
 
-func openHistoryStore(dir string) (*history.Store, error) {
-	if dir == "" {
-		return history.NewStore()
+func historyKey(cfg *Config, path, storeDir string) (string, scope.Policy, string, bool, error) {
+	root, err := absolutePath(path)
+	if err != nil {
+		return "", scope.Policy{}, "", false, err
 	}
-	return history.NewStoreAt(dir)
+	store, err := absolutePath(storeDir)
+	if err != nil {
+		return "", scope.Policy{}, "", false, fmt.Errorf("resolve history store: %w", err)
+	}
+	rootResolved := resolvedPath(root)
+	storeResolved := resolvedPath(store)
+	visibleStoreUnderRoot, visibleRelative := pathContainedBy(root, store)
+	resolvedStoreUnderRoot, resolvedRelative := pathContainedBy(rootResolved, storeResolved)
+	visibleRootUnderStore, _ := pathContainedBy(store, root)
+	resolvedRootUnderStore, _ := pathContainedBy(storeResolved, rootResolved)
+	if (visibleStoreUnderRoot && visibleRelative == ".") ||
+		(resolvedStoreUnderRoot && resolvedRelative == ".") ||
+		(visibleRootUnderStore && !visibleStoreUnderRoot) ||
+		(resolvedRootUnderStore && !resolvedStoreUnderRoot) {
+		return "", scope.Policy{}, "", false, errors.New("history store must not be the scan root or contain the scan root")
+	}
+	contained := visibleStoreUnderRoot || resolvedStoreUnderRoot
+
+	// A store outside the measured root cannot affect the scan and must not
+	// change its fingerprint. Only add the store's visible/canonical forms when
+	// it overlaps the root; otherwise source and destination history stores
+	// share the same key and migration remains queryable after relocation.
+	scanCfg := *cfg
+	scanCfg.ExcludePath = append([]string(nil), cfg.ExcludePath...)
+	if contained {
+		scanCfg.ExcludePath = append(scanCfg.ExcludePath, store, storeResolved)
+		if visibleStoreUnderRoot && visibleRelative != "." {
+			scanCfg.ExcludePath = append(scanCfg.ExcludePath, filepath.Join(root, visibleRelative))
+		}
+		if resolvedStoreUnderRoot && resolvedRelative != "." {
+			scanCfg.ExcludePath = append(scanCfg.ExcludePath, filepath.Join(root, resolvedRelative))
+		}
+	}
+	policy, err := scanCfg.policy()
+	if err != nil {
+		return "", scope.Policy{}, "", false, err
+	}
+	return root, policy, index.Fingerprint(root, policy), contained, nil
+}
+
+func resolvedPath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(resolved)
+}
+
+func pathContainedBy(parent, child string) (bool, string) {
+	relative, err := filepath.Rel(parent, child)
+	if err != nil || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false, ""
+	}
+	return true, relative
+}
+
+func configuredHistoryPolicy() (int, history.Policy, error) {
+	cfg, err := appconfig.Load()
+	if err != nil {
+		return 0, history.Policy{}, fmt.Errorf("load config: %w", err)
+	}
+	return cfg.HistoryMax, history.Policy{
+		MaxBytes: cfg.State.HistoryMaxBytes,
+		MaxAge:   time.Duration(cfg.State.HistoryTTLDays) * 24 * time.Hour,
+	}, nil
+}
+
+func openHistoryStore(dir string, maxRecords int, policy history.Policy, create bool) (*history.Store, error) {
+	if dir == "" {
+		defaultDir, err := history.DefaultStoreDir()
+		if err != nil {
+			return nil, err
+		}
+		if create {
+			return history.NewStoreAtWithPolicy(defaultDir, maxRecords, policy)
+		}
+		return history.OpenStoreAtWithPolicy(defaultDir, maxRecords, policy)
+	}
+	if create {
+		return history.NewStoreAtWithPolicy(dir, maxRecords, policy)
+	}
+	return history.OpenStoreAtWithPolicy(dir, maxRecords, policy)
 }
 
 func firstPath(args []string) string {

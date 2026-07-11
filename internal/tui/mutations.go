@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -26,7 +27,7 @@ func (m *model) applyCompletedOperations(results []fsops.Result) (map[string]boo
 	completed := make(map[string]bool)
 	changed, needsScan := false, !m.completeTree
 	for _, result := range results {
-		if result.Status != "ok" || result.DryRun {
+		if result.DryRun || (result.Status != fsops.ResultStatusOK && !result.MutationCompleted) {
 			continue
 		}
 		completed[result.OperationID] = true
@@ -54,16 +55,78 @@ func (m *model) applyCompletedOperations(results []fsops.Result) (map[string]boo
 	return completed, changed, needsScan
 }
 
+// resultNeedsReconciliation consumes the schema-v2 mutation outcome contract.
+// A partial status is authoritative even if a malformed producer omitted the
+// matching flag; MayHaveMutated is also fail-safe if a producer attached it to
+// an error or unknown status. Ordinary errors remain conservative because a
+// canceled or failed recursive operation may predate schema-v2 evidence.
+func resultNeedsReconciliation(result fsops.Result) bool {
+	if result.DryRun {
+		return false
+	}
+	if result.AuditStatus == fsops.AuditStatusFailed {
+		return true
+	}
+	switch result.Status {
+	case fsops.ResultStatusOK:
+		return result.MayHaveMutated
+	case fsops.ResultStatusPartial, fsops.ResultStatusError:
+		return true
+	default:
+		return true
+	}
+}
+
+func resultIndicatesPartialMutation(result fsops.Result) bool {
+	return !result.DryRun && (result.Status == fsops.ResultStatusPartial || result.MayHaveMutated)
+}
+
+// applyFailureMessage preserves the outer Apply error when present, while
+// still failing visibly if a schema-v2 non-ok result arrives without one.
+func applyFailureMessage(results []fsops.Result, applyErr error) string {
+	if applyErr != nil {
+		return applyErr.Error()
+	}
+	for _, result := range results {
+		if result.DryRun || result.Status == fsops.ResultStatusOK {
+			continue
+		}
+		if result.Error != "" {
+			return result.Error
+		}
+		return fmt.Sprintf("operation %q returned status %q", result.OperationID, result.Status)
+	}
+	return ""
+}
+
+// clearCompletedOperationMarks removes selections consumed by successful
+// operations while retaining marks that still back failed, partial, or
+// unattempted queue entries.
+func (m *model) clearCompletedOperationMarks(completed map[string]bool) {
+	for _, operation := range m.queue {
+		if !completed[operation.ID] {
+			continue
+		}
+		for path := range m.marks {
+			removeDescendants := operation.Action == fsops.ActionDelete ||
+				operation.Action == fsops.ActionMove || operation.Action == fsops.ActionRename
+			if filesystemPathEqual(operation.Source, path) || removeDescendants && filesystemPathContains(operation.Source, path) {
+				delete(m.marks, path)
+			}
+		}
+	}
+}
+
 // afterFilesystemMutation either starts a clean reconciliation scan or keeps
 // the exact in-memory delta and persists it as the newest complete cache
 // generation. Inspection is refreshed in both cases by the scan or directly.
 func (m *model) afterFilesystemMutation(changed, needsScan bool) tea.Cmd {
 	if needsScan {
-		return m.startScan()
+		return tea.Batch(m.startScan(), m.loadPressureCmd())
 	}
 	inspect := m.requestInspect()
-	if !changed || m.store == nil || !m.completeTree {
-		return inspect
+	if !changed || m.store == nil || !m.cacheWritable || !m.completeTree {
+		return tea.Batch(inspect, m.loadPressureCmd())
 	}
 
 	m.scanGeneration++
@@ -74,7 +137,7 @@ func (m *model) afterFilesystemMutation(changed, needsScan bool) tea.Cmd {
 		node:       m.root.Clone(),
 		stats:      m.stats,
 	}
-	return tea.Batch(saveCmd(&m.cacheSaves, m.store, m.rootAbs, m.fingerprint, msg), inspect)
+	return tea.Batch(saveCmd(m.ctx, &m.cacheSaves, m.store, m.rootAbs, m.fingerprint, msg), inspect, m.loadPressureCmd())
 }
 
 // auditMutationNeedsReconciliation reports whether fsops wrote its audit log
@@ -110,6 +173,7 @@ func (m *model) removeDeletedNode(op fsops.Operation, finished time.Time) (bool,
 	}
 
 	parent := node.Parent()
+	parentSelfAlloc := directorySelfAllocation(parent)
 	rel := node.Path()
 	files, dirs, errs := deletedCounts(node)
 	ambiguous := m.deleteNeedsReconciliation(node, op)
@@ -137,11 +201,21 @@ func (m *model) removeDeletedNode(op fsops.Operation, finished time.Time) (bool,
 			ancestor.ModTime = finished
 		}
 	}
+	if !m.refreshParentFilesystemMetadata(parent, parentSelfAlloc) {
+		ambiguous = true
+	}
 	m.stats.Files = subtractFloorInt(m.stats.Files, files)
 	m.stats.Dirs = subtractFloorInt(m.stats.Dirs, dirs)
 	m.stats.Errors -= int64(errs)
 	if m.stats.Errors < 0 {
 		m.stats.Errors = 0
+	}
+	m.stats.Complete = m.completeTree && m.stats.Errors == 0
+	if !ambiguous {
+		if finished.IsZero() {
+			finished = time.Now().UTC()
+		}
+		m.snapshotAt = finished.UTC()
 	}
 
 	for path := range m.marks {
@@ -160,6 +234,53 @@ func (m *model) removeDeletedNode(op fsops.Operation, finished time.Time) (bool,
 	return true, !ambiguous
 }
 
+func directorySelfAllocation(node *tree.Node) int64 {
+	self := node.Alloc
+	for _, child := range node.Children {
+		self = subtractFloor(self, child.Alloc)
+	}
+	return self
+}
+
+// refreshParentFilesystemMetadata closes the exact-delete accounting gap for
+// the directory entry itself. Removing a child can change the direct parent's
+// allocated directory blocks and mtime even when every removed descendant was
+// measured exactly. Failure falls back to the normal reconciliation scan.
+func (m *model) refreshParentFilesystemMetadata(parent *tree.Node, previousSelfAlloc int64) bool {
+	parentPath := m.rootAbs
+	if relative := parent.Path(); relative != "" {
+		parentPath = filepath.Join(m.rootAbs, filepath.FromSlash(relative))
+	}
+	entry, err := fsinfo.Inspect(parentPath, true)
+	if err != nil || entry.Kind != "directory" {
+		return false
+	}
+	delta := entry.Allocated - previousSelfAlloc
+	for ancestor := parent; ancestor != nil; ancestor = ancestor.Parent() {
+		if delta < 0 {
+			ancestor.Alloc = subtractFloor(ancestor.Alloc, -delta)
+			continue
+		}
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if delta > maxInt64-ancestor.Alloc {
+			return false
+		}
+		ancestor.Alloc += delta
+	}
+	parent.ModTime = entry.ModTime
+	for _, child := range parent.Children {
+		if child.ModTime.After(parent.ModTime) {
+			parent.ModTime = child.ModTime
+		}
+	}
+	for ancestor := parent.Parent(); ancestor != nil; ancestor = ancestor.Parent() {
+		if parent.ModTime.After(ancestor.ModTime) {
+			ancestor.ModTime = parent.ModTime
+		}
+	}
+	return true
+}
+
 func (m *model) findNode(path string) *tree.Node {
 	want := filepath.Clean(path)
 	var found *tree.Node
@@ -175,6 +296,17 @@ func (m *model) findNode(path string) *tree.Node {
 		return found == nil
 	})
 	return found
+}
+
+func (m *model) reconcileMarks() int {
+	removed := 0
+	for path := range m.marks {
+		if m.findNode(path) == nil {
+			delete(m.marks, path)
+			removed++
+		}
+	}
+	return removed
 }
 
 func (m *model) deleteNeedsReconciliation(node *tree.Node, op fsops.Operation) bool {
@@ -231,9 +363,20 @@ func filesystemPathContains(parent, candidate string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+func filesystemPathContainedBy(parent, candidate string) (bool, string) {
+	if candidate == "" {
+		return false, ""
+	}
+	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(candidate))
+	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, ""
+	}
+	return true, rel
+}
+
 func filesystemPathEqual(a, b string) bool {
 	a, b = filepath.Clean(a), filepath.Clean(b)
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == windowsOS {
 		return strings.EqualFold(a, b)
 	}
 	return a == b

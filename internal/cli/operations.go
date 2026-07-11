@@ -1,128 +1,76 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	appconfig "github.com/phillipod/go-dirstat/internal/config"
-	"github.com/phillipod/go-dirstat/internal/fsinfo"
 	"github.com/phillipod/go-dirstat/internal/fsops"
 )
 
 type planFlags struct {
-	root, output, mode, size, format string
-	uid, gid                         int
-	recursive                        bool
+	root, output, mode, size, format           string
+	files0From, operationsFrom, destinationDir string
+	sources                                    []string
+	uid, gid                                   int
+	recursive, summary                         bool
 }
 
 func newPlanCommand() *cobra.Command {
 	flags := planFlags{root: ".", output: "-", uid: -1, gid: -1}
 	cmd := &cobra.Command{
-		Use:   "plan ACTION SOURCE [DESTINATION]",
+		Use:   "plan [ACTION [SOURCE [DESTINATION]]]",
 		Short: "Create a guarded filesystem operation plan",
-		Args:  cobra.RangeArgs(2, 3),
+		Long: `Create a guarded filesystem operation plan.
+
+The positional ACTION SOURCE [DESTINATION] form creates one operation. For a
+uniform batch, use repeatable --source or bounded NUL input with --files0-from.
+Mixed actions use strict request-only JSONL with --operations-from. All inputs
+are normalized, guarded, and prevalidated before plan JSONL is emitted.
+
+Windows rejects chmod, chown, and explicit POSIX modes before a plan can be
+applied; default mkdir and touch behavior remains available.`,
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			plan, err := buildOperationPlan(cmd, flags, args)
+			built, err := buildOperationPlanDetailed(cmd, flags, args)
 			if err != nil {
 				return err
 			}
-			return writeOperationPlan(cmd, flags.output, plan)
+			if err := cmd.Context().Err(); err != nil {
+				return err
+			}
+			if err := writeOperationPlan(cmd, flags.output, built.plan); err != nil {
+				return err
+			}
+			if flags.summary {
+				return writePlanSummary(cmd, built.summary)
+			}
+			return nil
 		},
 	}
 	f := cmd.Flags()
 	f.StringVar(&flags.root, "root", ".", "confine all operation paths to this directory")
 	f.StringVarP(&flags.output, "output", "o", "-", "write JSONL plan to this file (- for stdout)")
-	f.StringVar(&flags.mode, "mode", "", "octal mode for mkdir, touch, or chmod")
+	f.StringVar(&flags.mode, "mode", "", "POSIX octal mode for mkdir, touch, or chmod (unsupported on Windows)")
 	f.StringVar(&flags.size, "size", "", "target size for truncate (bytes or K/M/G/T/P/E suffix)")
-	f.IntVar(&flags.uid, "uid", -1, "numeric owner ID for chown")
-	f.IntVar(&flags.gid, "gid", -1, "numeric group ID for chown")
+	f.IntVar(&flags.uid, "uid", -1, "numeric owner ID for chown (unsupported on Windows)")
+	f.IntVar(&flags.gid, "gid", -1, "numeric group ID for chown (unsupported on Windows)")
 	f.StringVar(&flags.format, "archive-format", "", "archive format: tar|tar.gz|zip (otherwise inferred)")
-	f.BoolVarP(&flags.recursive, "recursive", "r", false, "allow recursive directory deletion")
+	f.BoolVarP(&flags.recursive, "recursive", "r", false, "allow cancellable recursive directory deletion")
+	f.StringArrayVar(&flags.sources, "source", nil, "source path for a uniform action (repeatable)")
+	f.StringVar(&flags.files0From, "files0-from", "", "read NUL-terminated source paths from FILE (- for stdin; maximum 64 MiB)")
+	f.StringVar(&flags.operationsFrom, "operations-from", "", "read strict operation-request JSONL from FILE (- for stdin; maximum 64 MiB)")
+	f.StringVar(&flags.destinationDir, "destination-dir", "", "destination directory for batch copy, move, or rename")
+	f.BoolVar(&flags.summary, "summary", false, "write aggregate plan-impact JSON to stderr")
 	return cmd
-}
-
-func buildOperationPlan(cmd *cobra.Command, flags planFlags, args []string) (fsops.Plan, error) {
-	action, err := parseAction(args[0])
-	if err != nil {
-		return fsops.Plan{}, err
-	}
-	wantsDestination := action == fsops.ActionCopy || action == fsops.ActionMove || action == fsops.ActionRename ||
-		action == fsops.ActionArchive || action == fsops.ActionExtract
-	if wantsDestination && len(args) != 3 {
-		return fsops.Plan{}, fmt.Errorf("%s requires SOURCE and DESTINATION", action)
-	}
-	if !wantsDestination && len(args) != 2 {
-		return fsops.Plan{}, fmt.Errorf("%s accepts SOURCE only", action)
-	}
-
-	root, err := canonicalOperationRoot(flags.root)
-	if err != nil {
-		return fsops.Plan{}, err
-	}
-	source := operationPath(root, args[1])
-	op := fsops.Operation{ID: string(action) + "-1", Action: action, Source: source, Recursive: flags.recursive}
-	if wantsDestination {
-		op.Destination = operationPath(root, args[2])
-	}
-	if cmd.Flags().Changed("mode") {
-		mode, err := parseOperationMode(flags.mode)
-		if err != nil {
-			return fsops.Plan{}, err
-		}
-		op.Mode = &mode
-	}
-	if cmd.Flags().Changed("size") {
-		size, err := parseSize(flags.size)
-		if err != nil {
-			return fsops.Plan{}, fmt.Errorf("invalid --size %q: %w", flags.size, err)
-		}
-		op.Size = &size
-	}
-	if cmd.Flags().Changed("uid") {
-		if flags.uid < 0 {
-			return fsops.Plan{}, errors.New("--uid must be zero or greater")
-		}
-		op.UID = &flags.uid
-	}
-	if cmd.Flags().Changed("gid") {
-		if flags.gid < 0 {
-			return fsops.Plan{}, errors.New("--gid must be zero or greater")
-		}
-		op.GID = &flags.gid
-	}
-	op.Format = flags.format
-	if err := validatePlanFlags(cmd, action, op); err != nil {
-		return fsops.Plan{}, err
-	}
-
-	plan := fsops.Plan{
-		Header:     fsops.PlanHeader{Version: fsops.PlanVersion, Root: root, CreatedAt: time.Now().UTC()},
-		Operations: []fsops.Operation{op},
-	}
-	// Validate confinement and parameters before inspecting a target. This
-	// avoids reading metadata through an escaping symlink parent.
-	if _, err := fsops.Apply(cmd.Context(), plan, fsops.ApplyOptions{DryRun: true, Conflict: fsops.ConflictOverwrite, DisableAudit: true, AllowUnguarded: true}); err != nil {
-		return fsops.Plan{}, fmt.Errorf("validate plan: %w", err)
-	}
-	entry, err := fsinfo.Inspect(source, false)
-	if err == nil {
-		plan.Operations[0].Expected = &entry
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fsops.Plan{}, fmt.Errorf("inspect source: %w", err)
-	}
-	if _, err := fsops.Apply(cmd.Context(), plan, fsops.ApplyOptions{DryRun: true, Conflict: fsops.ConflictOverwrite, DisableAudit: true}); err != nil {
-		return fsops.Plan{}, fmt.Errorf("validate expected source: %w", err)
-	}
-	return plan, nil
 }
 
 func parseAction(value string) (fsops.Action, error) {
@@ -184,17 +132,6 @@ func canonicalOperationRoot(path string) (string, error) {
 	return resolved, nil
 }
 
-func operationPath(root, path string) string {
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(root, path)
-	}
-	abs, err := filepath.Abs(filepath.Clean(path))
-	if err != nil {
-		return filepath.Clean(path)
-	}
-	return abs
-}
-
 func parseOperationMode(value string) (uint32, error) {
 	original := value
 	value = strings.TrimSpace(value)
@@ -210,8 +147,25 @@ func parseOperationMode(value string) (uint32, error) {
 }
 
 func writeOperationPlan(cmd *cobra.Command, destination string, plan fsops.Plan) (err error) {
+	var encoded bytes.Buffer
+	if err := fsops.WritePlan(&encoded, plan); err != nil {
+		return err
+	}
+	if encoded.Len() > int(fsops.MaxPlanBytes) {
+		return fmt.Errorf("generated plan exceeds maximum size of %d bytes", fsops.MaxPlanBytes)
+	}
+	if err := cmd.Context().Err(); err != nil {
+		return err
+	}
 	if destination == "-" {
-		return fsops.WritePlan(cmd.OutOrStdout(), plan)
+		written, writeErr := cmd.OutOrStdout().Write(encoded.Bytes())
+		if writeErr != nil {
+			return writeErr
+		}
+		if written != encoded.Len() {
+			return io.ErrShortWrite
+		}
+		return nil
 	}
 	if strings.TrimSpace(destination) == "" {
 		return errors.New("--output must not be empty")
@@ -228,8 +182,12 @@ func writeOperationPlan(cmd *cobra.Command, destination string, plan fsops.Plan)
 			_ = os.Remove(destination)
 		}
 	}()
-	if err := fsops.WritePlan(f, plan); err != nil {
+	written, err := f.Write(encoded.Bytes())
+	if err != nil {
 		return err
+	}
+	if written != encoded.Len() {
+		return io.ErrShortWrite
 	}
 	return f.Sync()
 }
@@ -240,7 +198,13 @@ func newApplyCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "apply PLAN",
 		Short: "Validate and apply a filesystem operation plan",
-		Args:  cobra.ExactArgs(1),
+		Long: `Validate and apply a complete filesystem operation plan.
+
+PLAN is strict JSONL with exactly one object per physical line and a maximum
+size of 64 MiB. Unknown fields, duplicate keys or operation IDs, trailing JSON,
+and invalid operation dependencies are rejected before any mutation. Owned
+audit logs sync an intent before mutation and an outcome afterward.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !dryRun && !yes {
 				return errors.New("refusing to mutate without explicit --yes (use --dry-run to validate safely)")
@@ -279,9 +243,6 @@ func newApplyCommand() *cobra.Command {
 				if strings.TrimSpace(auditPath) == "" {
 					return errors.New("--audit must not be empty")
 				}
-				if err := os.MkdirAll(filepath.Dir(auditPath), 0o700); err != nil {
-					return fmt.Errorf("create audit directory: %w", err)
-				}
 			}
 			results, applyErr := fsops.Apply(cmd.Context(), plan, fsops.ApplyOptions{
 				DryRun: dryRun, Conflict: policy, AuditPath: auditPath, DisableAudit: noAudit,
@@ -296,14 +257,14 @@ func newApplyCommand() *cobra.Command {
 	f.BoolVar(&dryRun, "dry-run", false, "validate every operation without mutating files")
 	f.BoolVar(&yes, "yes", false, "confirm filesystem mutations")
 	f.StringVar(&conflict, "conflict", string(fsops.ConflictFail), "destination conflict policy: fail|overwrite")
-	f.StringVar(&auditPath, "audit", "", "append result JSONL to this audit file")
+	f.StringVar(&auditPath, "audit", "", "append and sync intent/outcome JSONL to this audit file")
 	f.BoolVar(&noAudit, "no-audit", false, "explicitly disable audit logging")
 	return cmd
 }
 
 func readOperationPlan(cmd *cobra.Command, path string) (plan fsops.Plan, err error) {
 	if path == "-" {
-		plan, err = fsops.ReadPlan(io.LimitReader(cmd.InOrStdin(), 64<<20))
+		plan, err = fsops.ReadPlanLimited(cmd.InOrStdin(), fsops.MaxPlanBytes)
 	} else {
 		f, openErr := os.Open(path)
 		if openErr != nil {
@@ -314,7 +275,7 @@ func readOperationPlan(cmd *cobra.Command, path string) (plan fsops.Plan, err er
 				err = closeErr
 			}
 		}()
-		plan, err = fsops.ReadPlan(io.LimitReader(f, 64<<20))
+		plan, err = fsops.ReadPlanLimited(f, fsops.MaxPlanBytes)
 	}
 	if err != nil {
 		return fsops.Plan{}, fmt.Errorf("read plan: %w", err)

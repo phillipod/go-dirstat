@@ -28,3 +28,6 @@ coverage.html
 .agents/
 .claude/
 .codex/
+
+# Local review and planning artifacts
+/docs/

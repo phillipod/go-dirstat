@@ -23,6 +23,8 @@ class_inference:
   internal/index: domain
   internal/skills: domain
   internal/config: foundation
+  internal/fileclass: foundation
+  internal/storefs: foundation
   internal/fsinfo: foundation
   internal/scope: foundation
   internal/format: foundation
@@ -45,6 +47,8 @@ ownership_inference:
   internal/index: engine
   internal/skills: engine
   internal/config: infra
+  internal/fileclass: infra
+  internal/storefs: infra
   internal/fsinfo: infra
   internal/scope: infra
   internal/format: infra

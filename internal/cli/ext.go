@@ -17,5 +17,6 @@ func newExtensionsCommand(cfg *Config) *cobra.Command {
 		SilenceUsage: true,
 	}
 	bindRichOutputFlags(cmd, cfg)
+	bindAllowPartialFlag(cmd, cfg)
 	return cmd
 }

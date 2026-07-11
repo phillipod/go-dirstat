@@ -37,6 +37,7 @@ func TestDefinitionsArePortableAndTamperEvident(t *testing.T) {
 				"dirstat query --kind=file --min-size=1G --format=tsv",
 				"dirstat inspect --format=json /srv/archive/old.log",
 				"dirstat history growth /srv",
+				"dirstat history growth --leaf-only --limit=50 --format=json /srv",
 			} {
 				if !bytes.Contains(definition, []byte(command)) {
 					t.Fatalf("definition missing command guide %q:\n%s", command, definition)

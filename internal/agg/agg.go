@@ -7,8 +7,8 @@ package agg
 import (
 	"container/heap"
 	"sort"
-	"strings"
 
+	"github.com/phillipod/go-dirstat/internal/fileclass"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
 
@@ -84,7 +84,10 @@ func Extensions(root *tree.Node, sm tree.SizeMode) []ExtStat {
 		if n.Err != nil {
 			return true
 		}
-		ext := classifyExt(n.Name)
+		ext := fileclass.Extension(n.Name)
+		if ext == "" {
+			ext = "(none)"
+		}
 		e := bucket(ext)
 		e.Count++
 		e.Apparent += n.Apparent
@@ -116,16 +119,6 @@ func dirSubtreeAlloc(n *tree.Node) int64 {
 		sum += c.Alloc
 	}
 	return sum
-}
-
-// classifyExt returns the lowercased extension with a leading dot, or
-// "(none)" when the name has no extension.
-func classifyExt(name string) string {
-	if i := strings.LastIndexByte(name, '.'); i > 0 && i < len(name)-1 {
-		// avoid treating dotfiles like ".gitignore" as ext ".gitignore"
-		return strings.ToLower(name[i:])
-	}
-	return "(none)"
 }
 
 // TopFiles returns the n largest files in root by the given size mode. It keeps

@@ -3,6 +3,9 @@
 // (so wide, deep trees parallelise across directories), with the number of
 // active directory traversals and entry stat workers both bounded by
 // Concurrency (GOMAXPROCS by default).
+// Directory streams are consumed in bounded batches, so a very wide directory
+// retains its authoritative nodes without also retaining full-width entry,
+// stat-result, classification-plan, and recursion slices.
 //
 // The scan builds a single live tree whose aggregates are updated incrementally
 // as each entry is measured, so ScanStream can hand a UI consistent, partial
@@ -15,12 +18,15 @@
 package scan
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +42,9 @@ type Options struct {
 	// Concurrency bounds active directory traversal and stat work. Defaults to
 	// GOMAXPROCS.
 	Concurrency int
+	// directoryBatchSize is an internal test override. Production scans use the
+	// bounded defaultDirectoryBatchSize.
+	directoryBatchSize int
 }
 
 // DefaultOptions returns the safe defaults: scope.New() policy and GOMAXPROCS
@@ -51,11 +60,12 @@ func WithPolicy(p scope.Policy) Options {
 
 // Stats summarises a completed scan.
 type Stats struct {
-	Files   int           // regular files measured
-	Dirs    int           // directories measured (including root if dir)
-	Errors  int64         // non-fatal per-entry errors
-	Elapsed time.Duration // wall-clock scan time
-	RootFS  string        // filesystem type of the root, if known
+	Files    int           // regular files measured
+	Dirs     int           // directories measured (including root if dir)
+	Errors   int64         // non-fatal per-entry errors
+	Elapsed  time.Duration // wall-clock scan time
+	RootFS   string        // filesystem type of the root, if known
+	Complete bool          // true only when the final scan had no entry errors
 }
 
 // Scan walks root and returns the measured tree. It is ScanStream with no
@@ -156,22 +166,13 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 		dirSlots:     make(chan struct{}, max(0, opts.Concurrency-1)),
 		statJobs:     make(chan statTask, opts.Concurrency),
 		rootFS:       rootFS,
-		visited:      make(map[devIno]struct{}),
-		visitedPaths: make(map[string]struct{}),
 		fileGroups:   make(map[fileKey]*fileGroup),
+		dirBatchSize: opts.directoryBatchSize,
 	}
 	if opts.Policy.FollowSymlinks {
 		s.loopMu = &sync.Mutex{}
-		if info.IsDir() {
-			// Seed the target inode before walking. Otherwise a symlink from a
-			// descendant back to the root is accepted once and the entire root
-			// subtree is measured a second time before the loop is noticed.
-			if dev, ino, ok := identityOfPath(rootFSPath, info); ok {
-				s.visited[devIno{dev, ino}] = struct{}{}
-			} else {
-				s.visitedPaths[canonicalPath(rootFSPath)] = struct{}{}
-			}
-		}
+		s.dirGroups = make(map[dirKey]*dirGroup)
+		s.dirSelf = make(map[*tree.Node]dirMetadata)
 	}
 	period := p.Period
 	if period <= 0 {
@@ -198,14 +199,30 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 	if info.IsDir() {
 		s.startStatWorkers(opts.Concurrency)
 		node = &tree.Node{Name: filepath.Base(rootAbs), IsDir: true, Depth: 0}
+		var rootGroup *dirGroup
+		if s.loopMu != nil {
+			rootGroup = s.registerRootDirectory(rootFSPath, info, node)
+		}
 		lt.root = node
-		s.scanDir(rootAbs, "", info, devOfPath(rootAbs, info), rootFS, 0, node, lt)
+		s.scanDir(rootAbs, "", info, devOfPath(rootAbs, info), rootFS, 0, node, rootGroup, lt)
 		s.stopStatWorkers()
-		// Directory scans can discover the same file identity from concurrent
-		// branches (hardlinks or followed aliases). Streaming counts it once as
-		// soon as it is seen; this final pass makes the owning display path
-		// deterministic without changing the total.
-		lt.record(s.normalizeFileOwners)
+		// Identity discovery is concurrent and therefore provisional. Select final
+		// directory and file owners only after traversal, then rebuild aggregates
+		// so the authoritative tree is independent of goroutine scheduling.
+		lt.record(func() {
+			if rootGroup != nil {
+				if err := s.canonicalizeDirectoryOwners(rootGroup); err != nil {
+					atomic.AddInt64(&s.errors, 1)
+					if node.Err == nil {
+						node.Err = err
+					}
+				}
+			}
+			s.normalizeFileOwners()
+			if rootGroup != nil {
+				s.recomputeDirectory(node)
+			}
+		})
 	} else {
 		node = s.makeFile(filepath.Base(rootAbs), info, 0)
 		atomic.AddInt64(&s.files, 1)
@@ -218,39 +235,84 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 	// emitter so no goroutine outlives the call and the final tree supersedes
 	// every snapshot.
 	if lt.out != nil {
-		lt.emitFinal()
+		lt.emitFinal(s.ctx.Err() == nil && atomic.LoadInt64(&s.errors) == 0)
 		close(lt.out)
 		<-lt.done
 	}
 
+	scanErr := ctx.Err()
+	errorCount := atomic.LoadInt64(&s.errors)
 	stats := Stats{
-		Files:   int(atomic.LoadInt64(&s.files)),
-		Dirs:    int(atomic.LoadInt64(&s.dirs)),
-		Errors:  atomic.LoadInt64(&s.errors),
-		Elapsed: time.Since(start),
-		RootFS:  rootFS,
+		Files:    int(atomic.LoadInt64(&s.files)),
+		Dirs:     int(atomic.LoadInt64(&s.dirs)),
+		Errors:   errorCount,
+		Elapsed:  time.Since(start),
+		RootFS:   rootFS,
+		Complete: scanErr == nil && errorCount == 0,
 	}
-	return node, stats, ctx.Err()
+	return node, stats, scanErr
 }
 
-type devIno struct{ dev, ino uint64 }
-
 type scanner struct {
-	ctx          context.Context
-	opts         Options
-	sem          chan struct{} // bounds concurrent directory reads
-	dirSlots     chan struct{} // bounds recursive directory goroutines
-	statJobs     chan statTask // shared, process-wide entry-stat pool
-	statWG       sync.WaitGroup
-	rootFS       string
-	files        int64
-	dirs         int64
-	errors       int64
-	visited      map[devIno]struct{}
-	visitedPaths map[string]struct{}
-	loopMu       *sync.Mutex // non-nil only when following symlinks
-	fileMu       sync.Mutex
-	fileGroups   map[fileKey]*fileGroup
+	ctx        context.Context
+	opts       Options
+	sem        chan struct{} // bounds concurrent directory reads
+	dirSlots   chan struct{} // bounds recursive directory goroutines
+	statJobs   chan statTask // shared, process-wide entry-stat pool
+	statWG     sync.WaitGroup
+	rootFS     string
+	files      int64
+	dirs       int64
+	errors     int64
+	loopMu     *sync.Mutex // non-nil only when following symlinks
+	dirGroups  map[dirKey]*dirGroup
+	dirOrder   []*dirGroup
+	dirSelf    map[*tree.Node]dirMetadata
+	fileMu     sync.Mutex
+	fileGroups map[fileKey]*fileGroup
+	// openDir is nil in production. Tests and benchmarks may replace directory
+	// contents without creating hundreds of thousands of real filesystem entries.
+	openDir      func(string) (directoryReader, error)
+	dirBatchSize int
+	batchDone    func() // optional deterministic cancellation/measurement seam
+}
+
+type directoryReader interface {
+	ReadDir(int) ([]os.DirEntry, error)
+	Close() error
+}
+
+// defaultDirectoryBatchSize bounds transient directory-entry, stat-result,
+// classification-plan, and recursion-record storage. The authoritative tree
+// still retains one node per visible entry, but traversal overhead no longer
+// scales with the width of a single directory.
+const defaultDirectoryBatchSize = 4096
+
+// dirKey identifies one physical directory. Stable device/file identities are
+// preferred; canonical paths keep loop protection and alias grouping available
+// on platforms or filesystems that cannot expose them.
+type dirKey struct {
+	dev, ino uint64
+	path     string
+}
+
+// dirGroup is one physical directory in the followed-directory graph. Exactly
+// one node is scanned; edges retain every visible directory entry that reached
+// an identity so a deterministic representative can be selected afterwards.
+type dirGroup struct {
+	key   dirKey
+	node  *tree.Node
+	edges []dirEdge
+}
+
+type dirEdge struct {
+	name  string
+	group *dirGroup
+}
+
+type dirMetadata struct {
+	alloc   int64
+	modTime time.Time
 }
 
 // fileKey identifies files that must contribute bytes only once. Unix file
@@ -351,12 +413,14 @@ func (lt *liveTree) record(mutate func()) {
 // the streamed view reaches its final total before the authoritative
 // scanDoneMsg. It bypasses the throttle by design. Non-blocking: if the buffer
 // is somehow full, scanDoneMsg supersedes it anyway.
-func (lt *liveTree) emitFinal() {
+func (lt *liveTree) emitFinal(complete bool) {
 	if lt.onTick == nil {
 		return
 	}
 	lt.mu.Lock()
-	snap := snapshot{node: lt.root.ShallowClone(snapshotDepth, snapshotCap), stats: lt.stats()}
+	stats := lt.stats()
+	stats.Complete = complete
+	snap := snapshot{node: lt.root.ShallowClone(snapshotDepth, snapshotCap), stats: stats}
 	lt.mu.Unlock()
 	select {
 	case lt.out <- snap:
@@ -428,8 +492,29 @@ func (*liveTree) bumpDirCount(child *tree.Node) {
 // only node with no parent. Direct files are revealed immediately and directory
 // children appear as zero-size placeholders that fill in as they are scanned, so
 // the tree populates top-down and every node's total climbs monotonically.
-func (s *scanner) scanDir(abs, rel string, info fs.FileInfo, dev uint64, fstype string, depth int, n *tree.Node, lt *liveTree) {
+func (s *scanner) scanDir(abs, rel string, info fs.FileInfo, dev uint64, fstype string, depth int, n *tree.Node, group *dirGroup, lt *liveTree) {
 	atomic.AddInt64(&s.dirs, 1)
+	// Directory identity, allocation, and mtime are known from the parent stat.
+	// Publish them before ReadDir so a permission or race failure leaves an
+	// explicitly incomplete node with its known self metadata instead of a
+	// misleading zero-size placeholder.
+	lt.record(func() {
+		n.Alloc = allocBytes(info)
+		n.ModTime = info.ModTime()
+		if s.dirSelf != nil {
+			s.dirSelf[n] = dirMetadata{alloc: n.Alloc, modTime: n.ModTime}
+		}
+		lt.propagateSelf(n)
+	})
+	// os.File.ReadDir(n) follows native directory order rather than os.ReadDir's
+	// lexical order. Sort only the retained node pointers after the directory is
+	// complete, preserving the historical deterministic tree without another
+	// full-width entry/result/plan allocation.
+	defer lt.record(func() {
+		sort.Slice(n.Children, func(i, j int) bool {
+			return n.Children[i].Name < n.Children[j].Name
+		})
+	})
 
 	if err := s.ctx.Err(); err != nil {
 		lt.record(func() { n.Err = err })
@@ -446,96 +531,165 @@ func (s *scanner) scanDir(abs, rel string, info fs.FileInfo, dev uint64, fstype 
 		lt.record(func() { n.Err = err })
 		return
 	}
-	entries, rerr := os.ReadDir(abs)
+	dir, rerr := s.openDirectory(abs)
 	s.release()
 	if rerr != nil {
 		atomic.AddInt64(&s.errors, 1)
 		lt.record(func() { n.Err = rerr })
 		return
 	}
+	defer func() { _ = dir.Close() }()
 
-	// Filter by name/path/glob policy first, then stat the survivors.
-	survivors := make([]os.DirEntry, 0, len(entries))
-	for _, e := range entries {
+	for {
+		if err := s.ctx.Err(); err != nil {
+			lt.record(func() { n.Err = err })
+			return
+		}
+		if !s.acquire() {
+			lt.record(func() { n.Err = s.ctx.Err() })
+			return
+		}
+		entries, readErr := dir.ReadDir(s.directoryBatchSize())
+		s.release()
+		if len(entries) > 0 && !s.processDirectoryBatch(abs, rel, dev, fstype, depth, n, group, entries, lt) {
+			return
+		}
+		if len(entries) > 0 && s.batchDone != nil {
+			s.batchDone()
+		}
+		if readErr == nil && len(entries) > 0 {
+			continue
+		}
+		if readErr == io.EOF {
+			return
+		}
+		if readErr == nil {
+			readErr = io.ErrNoProgress
+		}
+		atomic.AddInt64(&s.errors, 1)
+		lt.record(func() { n.Err = readErr })
+		return
+	}
+}
+
+func (s *scanner) openDirectory(path string) (directoryReader, error) {
+	if s.openDir != nil {
+		return s.openDir(path)
+	}
+	return os.Open(path)
+}
+
+func (s *scanner) directoryBatchSize() int {
+	if s.dirBatchSize > 0 {
+		return s.dirBatchSize
+	}
+	return defaultDirectoryBatchSize
+}
+
+type entryPlan struct {
+	node *tree.Node
+	dir  *dirChild
+}
+
+type directoryRecursion struct {
+	dir   dirChild
+	child *tree.Node
+}
+
+// processDirectoryBatch owns every transient slice for one bounded batch. It
+// filters entries in place, waits for the shared stat pool, classifies results,
+// publishes final nodes/placeholders, and completes directory recursion before
+// the caller reads another batch.
+func (s *scanner) processDirectoryBatch(abs, rel string, dev uint64, fstype string, depth int, n *tree.Node, group *dirGroup, entries []os.DirEntry, lt *liveTree) bool {
+	write := 0
+	for _, entry := range entries {
 		if s.ctx.Err() != nil {
 			break
 		}
-		en := e.Name()
-		er := joinRel(rel, en)
-		if s.opts.Policy.Entry(er, en, filepath.Join(abs, en)) {
-			survivors = append(survivors, e)
+		name := entry.Name()
+		entryRel := joinRel(rel, name)
+		if s.opts.Policy.Entry(entryRel, name, filepath.Join(abs, name)) {
+			entries[write] = entry
+			write++
 		}
 	}
-	stats := s.statAll(abs, survivors)
-
-	type plan struct {
-		node *tree.Node
-		dir  *dirChild
+	clear(entries[write:])
+	if err := s.ctx.Err(); err != nil {
+		lt.record(func() { n.Err = err })
+		return false
 	}
-	plans := make([]plan, 0, len(stats))
-	for _, r := range stats {
-		if !r.complete || s.ctx.Err() != nil {
+
+	results := s.statAll(abs, entries[:write])
+	plans := make([]entryPlan, 0, len(results))
+	for _, result := range results {
+		if !result.complete || s.ctx.Err() != nil {
 			break
 		}
-		node, dc := s.classifyEntry(abs, rel, dev, fstype, depth, r)
-		plans = append(plans, plan{node, dc})
+		node, dir := s.classifyEntry(abs, rel, dev, fstype, depth, result)
+		plans = append(plans, entryPlan{node: node, dir: dir})
 	}
 	cancelErr := s.ctx.Err()
 
-	// Adopt files and directory placeholders under the lock in one batch,
-	// propagating contributions up to the root. Directory placeholders are
-	// recursed into afterwards; they fill in (and their totals climb) as their
-	// own scans run.
-	type rec struct {
-		dir   dirChild
-		child *tree.Node
-	}
-	var recs []rec
+	var recursions []directoryRecursion
 	lt.record(func() {
-		n.Alloc = allocBytes(info) // a directory contributes its own inode allocation
-		n.ModTime = info.ModTime()
 		if cancelErr != nil {
 			n.Err = cancelErr
 		}
-		lt.propagateSelf(n)
-		for _, pl := range plans {
+		for _, plan := range plans {
 			switch {
-			case pl.node != nil:
-				n.Adopt(pl.node)
-				lt.propagateFile(pl.node)
-			case pl.dir != nil:
-				child := &tree.Node{Name: pl.dir.name, IsDir: true, Depth: depth + 1}
+			case plan.node != nil:
+				n.Adopt(plan.node)
+				lt.propagateFile(plan.node)
+			case plan.dir != nil:
+				if group != nil {
+					group.edges = append(group.edges, dirEdge{name: plan.dir.name, group: plan.dir.group})
+				}
+				if !plan.dir.scan {
+					continue
+				}
+				child := &tree.Node{Name: plan.dir.name, IsDir: true, Depth: depth + 1}
+				if plan.dir.group != nil {
+					plan.dir.group.node = child
+				}
 				n.Adopt(child)
 				lt.bumpDirCount(child)
-				recs = append(recs, rec{*pl.dir, child})
+				recursions = append(recursions, directoryRecursion{dir: *plan.dir, child: child})
 			}
 		}
 	})
 	if cancelErr != nil {
-		return
+		return false
 	}
 
-	if len(recs) == 0 {
-		return
+	s.scanDirectoryChildren(recursions, depth, lt)
+	if err := s.ctx.Err(); err != nil {
+		lt.record(func() { n.Err = err })
+		return false
 	}
+	return true
+}
+
+func (s *scanner) scanDirectoryChildren(recursions []directoryRecursion, depth int, lt *liveTree) {
 	var wg sync.WaitGroup
-	for _, r := range recs {
+	for _, recursion := range recursions {
 		if err := s.ctx.Err(); err != nil {
-			lt.record(func() { r.child.Err = err })
+			lt.record(func() { recursion.child.Err = err })
 			continue
 		}
 		select {
 		case s.dirSlots <- struct{}{}:
 			wg.Add(1)
-			go func(r rec) {
+			go func(recursion directoryRecursion) {
 				defer wg.Done()
 				defer func() { <-s.dirSlots }()
-				s.scanDir(r.dir.abs, r.dir.rel, r.dir.info, r.dir.dev, r.dir.fs, depth+1, r.child, lt)
-			}(r)
+				dir := recursion.dir
+				s.scanDir(dir.abs, dir.rel, dir.info, dir.dev, dir.fs, depth+1, recursion.child, dir.group, lt)
+			}(recursion)
 		default:
 			// All traversal slots are occupied. Recurse in this goroutine so
 			// progress continues without creating an unbounded waiter set.
-			s.scanDir(r.dir.abs, r.dir.rel, r.dir.info, r.dir.dev, r.dir.fs, depth+1, r.child, lt)
+			dir := recursion.dir
+			s.scanDir(dir.abs, dir.rel, dir.info, dir.dev, dir.fs, depth+1, recursion.child, dir.group, lt)
 		}
 	}
 	wg.Wait()
@@ -548,6 +702,8 @@ type dirChild struct {
 	info           fs.FileInfo
 	dev            uint64
 	fs             string
+	group          *dirGroup
+	scan           bool
 }
 
 // classifyEntry applies the scope policy to one stat result and returns either a
@@ -578,10 +734,14 @@ func (s *scanner) classifyEntry(abs, rel string, parentDev uint64, parentFS stri
 		return nil, nil
 	}
 	if info.IsDir() {
-		if s.loopMu != nil && s.seenDirectory(eabs, info) {
-			return nil, nil // symlink loop or already-seen real dir
+		dir := &dirChild{
+			abs: eabs, rel: er, name: r.name, info: info, dev: childDev, fs: childFS,
+			scan: true,
 		}
-		return nil, &dirChild{abs: eabs, rel: er, name: r.name, info: info, dev: childDev, fs: childFS}
+		if s.loopMu != nil {
+			dir.group, dir.scan = s.claimDirectory(eabs, info)
+		}
+		return nil, dir
 	}
 	if !s.opts.Policy.File(info.Size()) {
 		return nil, nil
@@ -672,43 +832,49 @@ func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, error) {
 	if s.opts.Policy.FollowSymlinks && e.Type()&fs.ModeSymlink != 0 {
 		return os.Stat(p) // follow
 	}
-	return os.Lstat(p)
+	return e.Info()
 }
 
-// markVisited records a directory's (dev,ino) and reports whether it was
-// already seen (a symlink loop or a hardlinked duplicate). Used only when
-// following symlinks.
-func (s *scanner) markVisited(dev, ino uint64) bool {
-	k := devIno{dev, ino}
+// registerRootDirectory seeds the followed-directory graph before traversal.
+// A later edge back to the root therefore remains an alias edge and is never
+// recursed into, preserving loop protection without relying on discovery order.
+func (s *scanner) registerRootDirectory(path string, info fs.FileInfo, node *tree.Node) *dirGroup {
+	key := directoryIdentity(path, info)
+	group := &dirGroup{key: key, node: node}
+	s.dirGroups[key] = group
+	s.dirOrder = append(s.dirOrder, group)
+	return group
+}
+
+// claimDirectory returns the identity group for path and whether this caller
+// must scan it. The first claimant does the I/O; all later claimants still add
+// graph edges so final display ownership can be selected deterministically.
+func (s *scanner) claimDirectory(path string, info fs.FileInfo) (*dirGroup, bool) {
+	key := directoryIdentity(path, info)
 	s.loopMu.Lock()
 	defer s.loopMu.Unlock()
-	if _, ok := s.visited[k]; ok {
-		return true
+	if group, ok := s.dirGroups[key]; ok {
+		return group, false
 	}
-	s.visited[k] = struct{}{}
-	return false
+	group := &dirGroup{key: key}
+	s.dirGroups[key] = group
+	s.dirOrder = append(s.dirOrder, group)
+	return group, true
 }
 
-// seenDirectory records a directory by Unix file identity when available and
-// falls back to its canonical path elsewhere. The fallback is essential on
-// platforms whose FileInfo has no device/inode fields: treating every entry as
-// (0,0) skips valid trees, while disabling tracking permits symlink loops.
-func (s *scanner) seenDirectory(path string, info fs.FileInfo) bool {
+func directoryIdentity(path string, info fs.FileInfo) dirKey {
 	if dev, ino, ok := identityOfPath(path, info); ok {
-		return s.markVisited(dev, ino)
+		return dirKey{dev: dev, ino: ino}
 	}
+	return fallbackDirectoryIdentity(path)
+}
+
+func fallbackDirectoryIdentity(path string) dirKey {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		resolved = path
 	}
-	key := canonicalPath(resolved)
-	s.loopMu.Lock()
-	defer s.loopMu.Unlock()
-	if _, ok := s.visitedPaths[key]; ok {
-		return true
-	}
-	s.visitedPaths[key] = struct{}{}
-	return false
+	return dirKey{path: canonicalPath(resolved)}
 }
 
 func canonicalPath(path string) string {
@@ -717,6 +883,136 @@ func canonicalPath(path string) string {
 		return strings.ToLower(path)
 	}
 	return path
+}
+
+type dirPathCandidate struct {
+	path   string
+	name   string
+	parent *dirGroup
+	group  *dirGroup
+}
+
+type dirPathHeap []dirPathCandidate
+
+func (h dirPathHeap) Len() int { return len(h) }
+
+func (h dirPathHeap) Less(i, j int) bool {
+	if h[i].path != h[j].path {
+		return h[i].path < h[j].path
+	}
+	return dirKeyLess(h[i].group.key, h[j].group.key)
+}
+
+func (h dirPathHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *dirPathHeap) Push(value any) {
+	*h = append(*h, value.(dirPathCandidate))
+}
+
+func (h *dirPathHeap) Pop() any {
+	old := *h
+	n := len(old)
+	value := old[n-1]
+	old[n-1] = dirPathCandidate{}
+	*h = old[:n-1]
+	return value
+}
+
+func dirKeyLess(a, b dirKey) bool {
+	if a.path != b.path {
+		return a.path < b.path
+	}
+	if a.dev != b.dev {
+		return a.dev < b.dev
+	}
+	return a.ino < b.ino
+}
+
+// canonicalizeDirectoryOwners selects the lexicographically first reachable
+// path to each physical directory. It is a best-first traversal of the complete
+// alias graph: a group is assigned only once, so back-edges and cross-links can
+// never create a cycle in the materialized tree.
+func (s *scanner) canonicalizeDirectoryOwners(root *dirGroup) error {
+	if root == nil {
+		return nil
+	}
+	assigned := map[*dirGroup]bool{root: true}
+	frontier := &dirPathHeap{}
+	heap.Init(frontier)
+	pushDirectoryEdges(frontier, root, "")
+	for frontier.Len() > 0 {
+		candidate := heap.Pop(frontier).(dirPathCandidate)
+		if assigned[candidate.group] {
+			continue
+		}
+		if candidate.group.node == nil {
+			// Cancellation can leave a claimed identity without a started scan.
+			// The scan is already incomplete; there is no subtree to relocate.
+			assigned[candidate.group] = true
+			continue
+		}
+		if candidate.parent == nil || candidate.parent.node == nil {
+			return fmt.Errorf("scan: directory alias %q has no measured parent", candidate.path)
+		}
+		node := candidate.group.node
+		if node.Parent() != candidate.parent.node || node.Name != candidate.name {
+			if !node.MoveTo(candidate.parent.node, candidate.name) {
+				return fmt.Errorf("scan: cannot select directory alias %q", candidate.path)
+			}
+		}
+		assigned[candidate.group] = true
+		pushDirectoryEdges(frontier, candidate.group, candidate.path)
+	}
+	for _, group := range s.dirOrder {
+		if group.node != nil && !assigned[group] {
+			return fmt.Errorf("scan: measured directory identity is unreachable from root")
+		}
+	}
+	return nil
+}
+
+func pushDirectoryEdges(frontier *dirPathHeap, parent *dirGroup, parentPath string) {
+	for _, edge := range parent.edges {
+		if edge.group == nil {
+			continue
+		}
+		path := filepath.ToSlash(edge.name)
+		if parentPath != "" {
+			path = parentPath + "/" + path
+		}
+		heap.Push(frontier, dirPathCandidate{
+			path: path, name: edge.name, parent: parent, group: edge.group,
+		})
+	}
+}
+
+// recomputeDirectory rebuilds a final directory's aggregate fields after alias
+// relocation and file-owner normalization. Directory self metadata is kept
+// separately because the live ModTime and Alloc fields already include children.
+func (s *scanner) recomputeDirectory(node *tree.Node) {
+	self := s.dirSelf[node]
+	apparent, alloc := int64(0), self.alloc
+	files, dirs := 0, 0
+	modTime := self.modTime
+	for _, child := range node.Children {
+		if child.IsDir {
+			s.recomputeDirectory(child)
+			dirs += child.DirCount + 1
+			files += child.FileCount
+		} else if child.Err == nil {
+			files++
+		}
+		apparent += child.Apparent
+		alloc += child.Alloc
+		if child.ModTime.After(modTime) {
+			modTime = child.ModTime
+		}
+	}
+	node.Apparent = apparent
+	node.Alloc = alloc
+	node.FileCount = files
+	node.DirCount = dirs
+	node.ModTime = modTime
 }
 
 // deduplicatedFile builds a file node and registers identities that can appear

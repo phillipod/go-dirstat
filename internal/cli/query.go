@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -12,32 +13,50 @@ import (
 
 	"github.com/spf13/cobra"
 
+	appconfig "github.com/phillipod/go-dirstat/internal/config"
 	"github.com/phillipod/go-dirstat/internal/format"
+	"github.com/phillipod/go-dirstat/internal/fsinfo"
+	"github.com/phillipod/go-dirstat/internal/index"
 	querypkg "github.com/phillipod/go-dirstat/internal/query"
 	"github.com/phillipod/go-dirstat/internal/scan"
+	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
 
 type queryFlags struct {
-	output     string
-	fields     string
-	older      string
-	newer      string
-	owners     []string
-	groups     []string
-	extensions []string
-	kinds      []string
-	pathGlob   string
-	pathRegexp string
-	sorts      []string
-	metadata   bool
-	minSize    string
-	maxSize    string
+	output        string
+	fields        string
+	older         string
+	newer         string
+	owners        []string
+	groups        []string
+	extensions    []string
+	kinds         []string
+	pathGlob      string
+	pathRegexp    string
+	sorts         []string
+	metadata      bool
+	allowPartial  bool
+	stream        bool
+	requireMatch  bool
+	failIfMatch   bool
+	limit         int
+	minSize       string
+	maxSize       string
+	indexMode     string
+	indexEvidence string
 }
 
 const (
 	queryFieldSize           = "size"
 	queryFieldAllocatedHuman = "allocated-human"
+	queryIndexLive           = "live"
+	queryIndexPrefer         = "prefer"
+	queryIndexOnly           = "only"
+	queryIndexRefresh        = "refresh"
+	queryIndexEvidenceText   = "text"
+	queryIndexEvidenceJSONL  = "jsonl"
+	unknownAge               = "n/a"
 )
 
 func newQueryCommand(cfg *Config) *cobra.Command {
@@ -45,7 +64,12 @@ func newQueryCommand(cfg *Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "query [path...]",
 		Short: "Find measured disk-usage candidates for scripts or review",
-		Args:  cobra.ArbitraryArgs,
+		Long: `Find measured disk-usage candidates for scripts or review.
+
+Sorted queries may use --limit to retain only the best records. --stream emits
+deterministic tree order without sorting or retaining a record set and cannot
+be combined with --sort.`,
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runQuery(cmd, cfg, qf, args)
 		},
@@ -57,14 +81,21 @@ func newQueryCommand(cfg *Config) *cobra.Command {
 	f.StringVar(&qf.maxSize, "max-size", "", "include candidates no larger than SIZE in the selected size mode")
 	f.StringVar(&qf.older, "older-than", "", "include entries at least this old (for example 7d or 24h)")
 	f.StringVar(&qf.newer, "newer-than", "", "include entries no more than this old")
-	f.StringArrayVar(&qf.owners, "owner", nil, "include only this owner name or uid (repeatable)")
-	f.StringArrayVar(&qf.groups, "group", nil, "include only this group name or gid (repeatable)")
+	f.StringArrayVar(&qf.owners, "owner", nil, "include only this owner name or uid (repeatable; unavailable on Windows)")
+	f.StringArrayVar(&qf.groups, "group", nil, "include only this group name or gid (repeatable; unavailable on Windows)")
 	f.StringArrayVar(&qf.extensions, "extension", nil, "include only this file extension (repeatable)")
 	f.StringArrayVar(&qf.kinds, "kind", nil, "include only file or directory entries (repeatable)")
 	f.StringVar(&qf.pathGlob, "path-glob", "", "match the portable relative path with a glob")
 	f.StringVar(&qf.pathRegexp, "path-regexp", "", "match the portable relative path with a regular expression")
 	f.StringArrayVar(&qf.sorts, "sort", []string{"size:desc"}, "sort FIELD[:asc|desc] (repeatable)")
 	f.BoolVar(&qf.metadata, "metadata", false, "inspect owner, group, mode, identity, and link metadata")
+	f.BoolVar(&qf.allowPartial, "allow-partial", false, "emit incomplete results and warn instead of exiting with status 3")
+	f.BoolVar(&qf.stream, "stream", false, "emit deterministic tree order without sorting or retaining all records")
+	f.BoolVar(&qf.requireMatch, "require-match", false, "exit 6 when no candidate matches")
+	f.BoolVar(&qf.failIfMatch, "fail-if-match", false, "exit 6 when one or more candidates match")
+	f.IntVar(&qf.limit, "limit", 0, "maximum records per scanned root (0 = unlimited)")
+	f.StringVar(&qf.indexMode, "index", queryIndexLive, "query source: live|prefer|only|refresh")
+	f.StringVar(&qf.indexEvidence, "index-evidence", queryIndexEvidenceText, "index evidence on stderr: text|jsonl")
 	return cmd
 }
 
@@ -87,6 +118,33 @@ func runQuery(cmd *cobra.Command, cfg *Config, flags queryFlags, paths []string)
 	if flags.output == outputFormatNUL && cmd.Flags().Changed("fields") {
 		return fmt.Errorf("--fields cannot be used with --format=nul; NUL output is always the absolute path")
 	}
+	if flags.limit < 0 {
+		return fmt.Errorf("--limit must be zero or greater")
+	}
+	if flags.stream && cmd.Flags().Changed("sort") {
+		return fmt.Errorf("--sort cannot be used with --stream; streaming preserves deterministic tree order")
+	}
+	if flags.requireMatch && flags.failIfMatch {
+		return fmt.Errorf("--require-match and --fail-if-match cannot be used together")
+	}
+	if !validQueryIndexMode(flags.indexMode) {
+		return fmt.Errorf("invalid --index %q: expected live, prefer, only, or refresh", flags.indexMode)
+	}
+	if flags.indexEvidence != queryIndexEvidenceText && flags.indexEvidence != queryIndexEvidenceJSONL {
+		return fmt.Errorf("invalid --index-evidence %q: expected text or jsonl", flags.indexEvidence)
+	}
+	if flags.indexMode == queryIndexLive && cmd.Flags().Changed("index-evidence") {
+		return errors.New("--index-evidence is only valid with --index=prefer, --index=only, or --index=refresh")
+	}
+	if flags.indexMode == queryIndexRefresh && flags.allowPartial {
+		return errors.New("--allow-partial cannot be used with --index=refresh; partial indexes are never published")
+	}
+	if flags.indexMode == queryIndexOnly && flags.allowPartial {
+		return errors.New("--allow-partial cannot be used with --index=only; persisted indexes are always complete")
+	}
+	if flags.indexEvidence == queryIndexEvidenceJSONL && flags.allowPartial {
+		return errors.New("--allow-partial cannot be used with --index-evidence=jsonl; stderr must remain parseable JSONL")
+	}
 	kinds, err := parseQueryKinds(flags.kinds)
 	if err != nil {
 		return err
@@ -94,6 +152,14 @@ func runQuery(cmd *cobra.Command, cfg *Config, flags queryFlags, paths []string)
 	sorts, err := parseQuerySorts(flags.sorts, cfg.sizeMode())
 	if err != nil {
 		return err
+	}
+	if err := validateQueryOwnershipCapability(fsinfo.OwnershipAvailable(), flags, fields, sorts); err != nil {
+		return err
+	}
+	if flags.indexMode == queryIndexOnly || flags.indexMode == queryIndexPrefer {
+		if flags.metadata || needsMetadata || len(flags.owners) > 0 || len(flags.groups) > 0 || querySortNeedsLiveMetadata(sorts) {
+			return errors.New("live metadata fields, filters, and sorts cannot be used with --index=prefer or --index=only")
+		}
 	}
 	minValue, maxValue := flags.minSize, flags.maxSize
 	// Cobra accepts persistent flags before the subcommand name. Honor those
@@ -138,31 +204,278 @@ func runQuery(cmd *cobra.Command, cfg *Config, flags queryFlags, paths []string)
 	if len(paths) == 0 {
 		paths = []string{"."}
 	}
-	for _, path := range paths {
-		root, _, err := scan.Scan(cmd.Context(), path, scan.Options{Policy: policy, Concurrency: cfg.Jobs})
+	var indexPolicy index.Policy
+	if flags.indexMode != queryIndexLive {
+		userCfg, err := appconfig.Load()
 		if err != nil {
-			return fmt.Errorf("%q: %w", path, err)
+			return fmt.Errorf("load config: %w", err)
 		}
-		records, err := querypkg.Build(root, path, querypkg.Options{
+		indexPolicy = index.Policy{
+			MaxBytes: userCfg.State.CacheMaxBytes,
+			MaxAge:   time.Duration(userCfg.State.CacheTTLHours) * time.Hour,
+		}
+	}
+	matched := 0
+	for _, path := range paths {
+		root, _, err := queryRoot(cmd, path, policy, cfg.Jobs, flags.indexMode, flags.indexEvidence, indexPolicy, flags.allowPartial)
+		if err != nil {
+			return err
+		}
+		options := querypkg.Options{
 			Filter: filter, Sort: sorts, Metadata: flags.metadata || needsMetadata,
-		})
+			FollowMetadata: cfg.Follow, Limit: flags.limit,
+		}
+		if flags.stream {
+			options.Sort = nil
+			err = querypkg.StreamContext(cmd.Context(), root, path, options, func(record querypkg.Record) error {
+				if err := renderQueryRecords(cmd, flags, fields, []querypkg.Record{record}, cfg.sizeMode()); err != nil {
+					return err
+				}
+				matched++
+				return nil
+			})
+		} else {
+			var records []querypkg.Record
+			records, err = querypkg.BuildContext(cmd.Context(), root, path, options)
+			if err == nil {
+				err = renderQueryRecords(cmd, flags, fields, records, cfg.sizeMode())
+				matched += len(records)
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("query %q: %w", path, err)
 		}
-		switch flags.output {
-		case outputFormatJSONL:
-			if cmd.Flags().Changed("fields") {
-				err = writeQueryJSONL(cmd.OutOrStdout(), records, fields, cfg.sizeMode())
-			} else {
-				err = querypkg.WriteJSONL(cmd.OutOrStdout(), records)
-			}
-		case outputFormatNUL:
-			err = querypkg.WriteNUL(cmd.OutOrStdout(), records)
-		default:
-			err = writeQueryTSV(cmd.OutOrStdout(), records, fields, cfg.sizeMode())
+	}
+	if flags.requireMatch && matched == 0 {
+		return &conditionError{code: ExitCandidateState, message: "query matched no candidates"}
+	}
+	if flags.failIfMatch && matched > 0 {
+		return &conditionError{code: ExitCandidateState, message: fmt.Sprintf("query matched %d candidate(s)", matched)}
+	}
+	return nil
+}
+
+func validQueryIndexMode(mode string) bool {
+	switch mode {
+	case queryIndexLive, queryIndexPrefer, queryIndexOnly, queryIndexRefresh:
+		return true
+	default:
+		return false
+	}
+}
+
+func querySortNeedsLiveMetadata(sorts []querypkg.SortKey) bool {
+	for _, key := range sorts {
+		if key.Field == querypkg.SortOwner || key.Field == querypkg.SortGroup {
+			return true
 		}
-		if err != nil {
-			return fmt.Errorf("render query for %q: %w", path, err)
+	}
+	return false
+}
+
+func rejectOperationalQueryRoot(root string) error {
+	statePaths := defaultStateExclusions()
+	resolvedRoot := resolvedPath(root)
+	for _, store := range statePaths {
+		contained, _ := pathContainedBy(resolvedPath(store), resolvedRoot)
+		if contained {
+			return fmt.Errorf("query root %q is inside dirstat operational state %q; use the state command instead", root, store)
+		}
+	}
+	return nil
+}
+
+func queryRoot(
+	cmd *cobra.Command,
+	displayPath string,
+	policy scope.Policy,
+	jobs int,
+	mode string,
+	evidenceFormat string,
+	storePolicy index.Policy,
+	allowPartial bool,
+) (*tree.Node, scan.Stats, error) {
+	absRoot, err := absolutePath(displayPath)
+	if err != nil {
+		return nil, scan.Stats{}, fmt.Errorf("resolve query root %q: %w", displayPath, err)
+	}
+	if err := rejectOperationalQueryRoot(absRoot); err != nil {
+		return nil, scan.Stats{}, err
+	}
+	if mode == queryIndexLive {
+		return liveQueryRoot(cmd, displayPath, policy, jobs, allowPartial)
+	}
+	fingerprint := index.Fingerprint(absRoot, policy)
+	storeDir, storeDirErr := index.DefaultStoreDir()
+	if storeDirErr != nil && mode != queryIndexPrefer {
+		return nil, scan.Stats{}, fmt.Errorf("resolve query index store: %w", storeDirErr)
+	}
+	if mode == queryIndexPrefer || mode == queryIndexOnly {
+		var snap *index.Snapshot
+		loadErr := storeDirErr
+		if loadErr == nil {
+			store, openErr := index.OpenStoreAtWithPolicy(storeDir, storePolicy)
+			if openErr != nil {
+				loadErr = fmt.Errorf("open query index: %w", openErr)
+			} else {
+				snap, loadErr = store.LoadContext(cmd.Context(), absRoot, fingerprint)
+			}
+		}
+		if loadErr == nil {
+			loadErr = validateQuerySnapshot(snap, storePolicy.MaxAge, time.Now())
+		}
+		if loadErr == nil {
+			node := snap.ToTree()
+			if node == nil {
+				loadErr = index.ErrIncompatible
+			} else {
+				if err := writeQueryIndexEvidence(cmd, evidenceFormat, mode, "index", absRoot, fingerprint, snap.ScannedAt, true, ""); err != nil {
+					return nil, scan.Stats{}, err
+				}
+				return node, scan.Stats{
+					Files: snap.Files, Dirs: snap.Dirs, Errors: snap.Errors,
+					RootFS: snap.RootFS, Complete: snap.Complete,
+				}, nil
+			}
+		}
+		if mode == queryIndexOnly {
+			return nil, scan.Stats{}, fmt.Errorf(
+				"query index for %q is unavailable: %w; run query --index=refresh for this root",
+				displayPath, loadErr,
+			)
+		}
+		node, stats, liveErr := liveQueryRoot(cmd, displayPath, policy, jobs, allowPartial)
+		if liveErr != nil {
+			return nil, scan.Stats{}, liveErr
+		}
+		if err := writeQueryIndexEvidence(cmd, evidenceFormat, mode, "live", absRoot, fingerprint, time.Now().UTC(), stats.Complete, "fallback="+loadErr.Error()); err != nil {
+			return nil, scan.Stats{}, err
+		}
+		return node, stats, nil
+	}
+
+	if err := cmd.Context().Err(); err != nil {
+		return nil, scan.Stats{}, err
+	}
+	writeStore, err := index.NewStoreAtWithPolicy(storeDir, storePolicy)
+	if err != nil {
+		return nil, scan.Stats{}, fmt.Errorf("create query index store: %w", err)
+	}
+	node, stats, err := liveQueryRoot(cmd, displayPath, policy, jobs, false)
+	if err != nil {
+		return nil, scan.Stats{}, err
+	}
+	snap := index.FromTree(node, fingerprint, stats.RootFS, stats.Files, stats.Dirs, stats.Errors, stats.Complete, time.Now().UTC())
+	snap.Root = absRoot
+	if err := writeStore.SaveContext(cmd.Context(), snap); err != nil {
+		return nil, scan.Stats{}, fmt.Errorf("publish query index for %q: %w", displayPath, err)
+	}
+	if err := writeQueryIndexEvidence(cmd, evidenceFormat, mode, "live", absRoot, fingerprint, snap.ScannedAt, true, "published"); err != nil {
+		return nil, scan.Stats{}, err
+	}
+	return node, stats, nil
+}
+
+func liveQueryRoot(cmd *cobra.Command, path string, policy scope.Policy, jobs int, allowPartial bool) (*tree.Node, scan.Stats, error) {
+	root, stats, err := scan.Scan(cmd.Context(), path, scan.Options{Policy: policy, Concurrency: jobs})
+	if err != nil {
+		return nil, scan.Stats{}, fmt.Errorf("%q: %w", path, err)
+	}
+	if err := acceptScan(cmd, path, stats, allowPartial); err != nil {
+		return nil, scan.Stats{}, err
+	}
+	return root, stats, nil
+}
+
+func validateQuerySnapshot(snap *index.Snapshot, maxAge time.Duration, now time.Time) error {
+	if snap == nil || !snap.Complete || snap.Errors != 0 {
+		return errors.New("persisted snapshot is incomplete")
+	}
+	if snap.ScannedAt.IsZero() {
+		return errors.New("persisted snapshot has no scan timestamp")
+	}
+	if snap.ScannedAt.After(now.Add(time.Minute)) {
+		return errors.New("persisted snapshot timestamp is in the future")
+	}
+	if now.Sub(snap.ScannedAt) > maxAge {
+		return fmt.Errorf("persisted snapshot is stale (age %s exceeds %s)", format.Age(now.Sub(snap.ScannedAt)), format.Age(maxAge))
+	}
+	return nil
+}
+
+func writeQueryIndexEvidence(
+	cmd *cobra.Command,
+	evidenceFormat string,
+	mode, source, root, fingerprint string,
+	scannedAt time.Time,
+	complete bool,
+	detail string,
+) error {
+	age := unknownAge
+	if !scannedAt.IsZero() {
+		age = format.Age(time.Since(scannedAt))
+	}
+	if evidenceFormat == queryIndexEvidenceJSONL {
+		return json.NewEncoder(cmd.ErrOrStderr()).Encode(struct {
+			Mode        string    `json:"mode"`
+			Source      string    `json:"source"`
+			Root        string    `json:"root"`
+			Age         string    `json:"age"`
+			Fingerprint string    `json:"fingerprint"`
+			Complete    bool      `json:"complete"`
+			ScannedAt   time.Time `json:"scanned_at,omitempty"`
+			Detail      string    `json:"detail,omitempty"`
+		}{mode, source, root, age, fingerprint, complete, scannedAt, detail})
+	}
+	if detail != "" {
+		detail = " detail=" + format.SafeText(detail)
+	}
+	_, err := fmt.Fprintf(
+		cmd.ErrOrStderr(),
+		"dirstat: query-index mode=%s source=%s root=%s age=%s fingerprint=%s complete=%t%s\n",
+		mode, source, format.SafeText(root), age, fingerprint, complete, detail,
+	)
+	if err != nil {
+		return fmt.Errorf("write query-index evidence: %w", err)
+	}
+	return nil
+}
+
+func renderQueryRecords(cmd *cobra.Command, flags queryFlags, fields []queryOutputField, records []querypkg.Record, mode tree.SizeMode) error {
+	switch flags.output {
+	case outputFormatJSONL:
+		if cmd.Flags().Changed("fields") {
+			return writeQueryJSONL(cmd.OutOrStdout(), records, fields, mode)
+		}
+		return querypkg.WriteJSONL(cmd.OutOrStdout(), records)
+	case outputFormatNUL:
+		return querypkg.WriteNUL(cmd.OutOrStdout(), records)
+	default:
+		return writeQueryTSV(cmd.OutOrStdout(), records, fields, mode)
+	}
+}
+
+func validateQueryOwnershipCapability(available bool, flags queryFlags, fields []queryOutputField, sorts []querypkg.SortKey) error {
+	if available {
+		return nil
+	}
+	if len(flags.owners) > 0 || len(flags.groups) > 0 {
+		return errors.New("owner and group query filters are unavailable on this platform")
+	}
+	for _, field := range fields {
+		switch field.raw {
+		case querypkg.FieldOwner, querypkg.FieldGroup, querypkg.FieldUID, querypkg.FieldGID:
+			return fmt.Errorf("query field %q is unavailable on this platform", field.name)
+		case querypkg.FieldPath, querypkg.FieldRelative, querypkg.FieldName, querypkg.FieldExtension,
+			querypkg.FieldKind, querypkg.FieldApparent, querypkg.FieldAllocated, querypkg.FieldFiles,
+			querypkg.FieldDirectories, querypkg.FieldMTime, querypkg.FieldMode, querypkg.FieldModeText,
+			querypkg.FieldLinks, querypkg.FieldDevice, querypkg.FieldFileID, querypkg.FieldHardlink,
+			querypkg.FieldScanError, querypkg.FieldMetadataError:
+		}
+	}
+	for _, key := range sorts {
+		if key.Field == querypkg.SortOwner || key.Field == querypkg.SortGroup {
+			return fmt.Errorf("query sort %q is unavailable on this platform", key.Field)
 		}
 	}
 	return nil

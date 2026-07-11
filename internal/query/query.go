@@ -3,6 +3,8 @@
 package query
 
 import (
+	"container/heap"
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phillipod/go-dirstat/internal/fileclass"
 	"github.com/phillipod/go-dirstat/internal/fsinfo"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
@@ -100,8 +103,10 @@ type Inspector func(path string, follow bool) (fsinfo.Entry, error)
 
 // Options controls record construction.
 type Options struct {
-	Filter         Filter
-	Sort           []SortKey
+	Filter Filter
+	Sort   []SortKey
+	// Limit bounds retained sorted records. Zero is unlimited.
+	Limit          int
 	Metadata       bool
 	FollowMetadata bool
 	Now            time.Time
@@ -112,19 +117,166 @@ type Options struct {
 // Relative paths always use forward slashes; absolute paths use the host's
 // native form. The root record has an empty relative path.
 func Build(measuredRoot *tree.Node, scanRoot string, opts Options) ([]Record, error) {
+	return BuildContext(context.Background(), measuredRoot, scanRoot, opts)
+}
+
+// BuildContext is Build with cancellation checked throughout tree traversal
+// and before and after potentially slow metadata inspection.
+func BuildContext(ctx context.Context, measuredRoot *tree.Node, scanRoot string, opts Options) ([]Record, error) {
 	if measuredRoot == nil {
 		return nil, errors.New("query: nil measured root")
 	}
-	root, err := filepath.Abs(filepath.Clean(scanRoot))
-	if err != nil {
-		return nil, fmt.Errorf("query: absolute root: %w", err)
-	}
-	compiled, err := compileFilter(opts.Filter)
-	if err != nil {
-		return nil, err
+	if opts.Limit < 0 {
+		return nil, errors.New("query: limit cannot be negative")
 	}
 	if err := validateSort(opts.Sort); err != nil {
 		return nil, err
+	}
+	keys := effectiveSortKeys(opts.Sort)
+	capacity := measuredRoot.FileCount + measuredRoot.DirCount + 1
+	if capacity < 0 {
+		capacity = 0
+	}
+	if opts.Limit > 0 && opts.Limit < capacity {
+		capacity = opts.Limit
+	}
+	if opts.Limit == 0 {
+		records := make([]Record, 0, capacity)
+		err := walkMatchingRecords(ctx, measuredRoot, scanRoot, opts, func(record Record) error {
+			records = append(records, record)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
+		sortRecords(records, keys)
+		return records, nil
+	}
+
+	top := &topRecordHeap{keys: keys, items: make([]rankedRecord, 0, capacity)}
+	order := 0
+	err := walkMatchingRecords(ctx, measuredRoot, scanRoot, opts, func(record Record) error {
+		candidate := rankedRecord{record: record, order: order}
+		order++
+		if top.Len() < opts.Limit {
+			heap.Push(top, candidate)
+		} else if rankedRecordBefore(candidate, top.items[0], keys) {
+			top.items[0] = candidate
+			heap.Fix(top, 0)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	sort.Slice(top.items, func(i, j int) bool {
+		return rankedRecordBefore(top.items[i], top.items[j], keys)
+	})
+	records := make([]Record, len(top.items))
+	for i := range top.items {
+		records[i] = top.items[i].record
+	}
+	return records, nil
+}
+
+type rankedRecord struct {
+	record Record
+	order  int
+}
+
+type topRecordHeap struct {
+	items []rankedRecord
+	keys  []SortKey
+}
+
+func (h topRecordHeap) Len() int { return len(h.items) }
+
+func (h topRecordHeap) Less(i, j int) bool {
+	return rankedRecordBefore(h.items[j], h.items[i], h.keys)
+}
+
+func (h topRecordHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+func (h *topRecordHeap) Push(value any) {
+	h.items = append(h.items, value.(rankedRecord))
+}
+
+func (h *topRecordHeap) Pop() any {
+	last := len(h.items) - 1
+	value := h.items[last]
+	h.items[last] = rankedRecord{}
+	h.items = h.items[:last]
+	return value
+}
+
+func rankedRecordBefore(a, b rankedRecord, keys []SortKey) bool {
+	if recordBefore(a.record, b.record, keys) {
+		return true
+	}
+	if recordBefore(b.record, a.record, keys) {
+		return false
+	}
+	return a.order < b.order
+}
+
+var errStreamLimit = errors.New("query: stream limit reached")
+
+// Stream visits matching records in deterministic tree order without sorting
+// or retaining a result slice. Limit zero is unlimited. Callers use this for
+// low-memory JSONL, TSV, or NUL pipelines where ordering is not required.
+func Stream(measuredRoot *tree.Node, scanRoot string, opts Options, visit func(Record) error) error {
+	return StreamContext(context.Background(), measuredRoot, scanRoot, opts, visit)
+}
+
+// StreamContext is Stream with cancellation checked throughout traversal and
+// metadata inspection.
+func StreamContext(ctx context.Context, measuredRoot *tree.Node, scanRoot string, opts Options, visit func(Record) error) error {
+	if opts.Limit < 0 {
+		return errors.New("query: limit cannot be negative")
+	}
+	if len(opts.Sort) != 0 {
+		return errors.New("query: streaming does not accept sort keys")
+	}
+	if visit == nil {
+		return errors.New("query: stream visitor is required")
+	}
+	count := 0
+	err := walkMatchingRecords(ctx, measuredRoot, scanRoot, opts, func(record Record) error {
+		if err := visit(record); err != nil {
+			return err
+		}
+		count++
+		if opts.Limit > 0 && count >= opts.Limit {
+			return errStreamLimit
+		}
+		return nil
+	})
+	if errors.Is(err, errStreamLimit) {
+		return nil
+	}
+	return err
+}
+
+func walkMatchingRecords(ctx context.Context, measuredRoot *tree.Node, scanRoot string, opts Options, visit func(Record) error) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if measuredRoot == nil {
+		return errors.New("query: nil measured root")
+	}
+	root, err := filepath.Abs(filepath.Clean(scanRoot))
+	if err != nil {
+		return fmt.Errorf("query: absolute root: %w", err)
+	}
+	compiled, err := compileFilter(opts.Filter)
+	if err != nil {
+		return err
 	}
 	now := opts.Now
 	if now.IsZero() {
@@ -136,44 +288,62 @@ func Build(measuredRoot *tree.Node, scanRoot string, opts Options) ([]Record, er
 	}
 	needMetadata := opts.Metadata || len(compiled.owners) > 0 || len(compiled.groups) > 0
 
-	records := make([]Record, 0, measuredRoot.FileCount+measuredRoot.DirCount+1)
-	var buildErr error
-	measuredRoot.Walk(func(n *tree.Node) bool {
+	var walk func(*tree.Node) error
+	walk = func(n *tree.Node) error {
+		if err := contextError(ctx); err != nil {
+			return err
+		}
 		rel := filepath.ToSlash(n.Path())
 		absolute := root
 		if rel != "" {
 			absolute = filepath.Join(root, filepath.FromSlash(rel))
 			inside, err := filepath.Rel(root, absolute)
 			if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
-				buildErr = fmt.Errorf("query: candidate %q escapes scan root", rel)
-				return false
+				return fmt.Errorf("query: candidate %q escapes scan root", rel)
 			}
 		}
 		r := recordFromNode(n, absolute, rel)
-		if !compiled.cheapMatch(r, now) {
-			return true
-		}
-		if needMetadata {
+		matched := compiled.cheapMatch(r, now)
+		if matched && needMetadata {
+			if err := contextError(ctx); err != nil {
+				return err
+			}
 			entry, err := inspect(absolute, opts.FollowMetadata)
+			if contextErr := contextError(ctx); contextErr != nil {
+				return contextErr
+			}
 			if err != nil {
 				r.MetadataError = err.Error()
 				if len(compiled.owners) > 0 || len(compiled.groups) > 0 {
-					return true
+					matched = false
 				}
 			} else {
 				copyMetadata(&r, entry)
 			}
 		}
-		if compiled.metadataMatch(r) {
-			records = append(records, r)
+		if matched && compiled.metadataMatch(r) {
+			if err := contextError(ctx); err != nil {
+				return err
+			}
+			if err := visit(r); err != nil {
+				return err
+			}
 		}
-		return true
-	})
-	if buildErr != nil {
-		return nil, buildErr
+		for _, child := range n.Children {
+			if err := walk(child); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	sortRecords(records, opts.Sort)
-	return records, nil
+	return walk(measuredRoot)
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 func recordFromNode(n *tree.Node, absolute, relative string) Record {
@@ -188,7 +358,7 @@ func recordFromNode(n *tree.Node, absolute, relative string) Record {
 		ModTime: n.ModTime, Hardlink: n.Hardlink,
 	}
 	if !n.IsDir {
-		r.Extension = strings.ToLower(filepath.Ext(n.Name))
+		r.Extension = fileclass.Extension(n.Name)
 	}
 	if n.Err != nil {
 		r.ScanError = n.Err.Error()
@@ -319,9 +489,7 @@ func validateSort(keys []SortKey) error {
 }
 
 func sortRecords(records []Record, keys []SortKey) {
-	if len(keys) == 0 {
-		keys = []SortKey{{Field: SortPath}}
-	}
+	keys = effectiveSortKeys(keys)
 	// Stable sorts from least to most significant preserve caller key priority.
 	for i := len(keys) - 1; i >= 0; i-- {
 		key := keys[i]
@@ -333,6 +501,27 @@ func sortRecords(records []Record, keys []SortKey) {
 			return cmp < 0
 		})
 	}
+}
+
+func effectiveSortKeys(keys []SortKey) []SortKey {
+	if len(keys) == 0 {
+		return []SortKey{{Field: SortPath}}
+	}
+	return keys
+}
+
+func recordBefore(a, b Record, keys []SortKey) bool {
+	for _, key := range effectiveSortKeys(keys) {
+		comparison := compare(a, b, key.Field)
+		if comparison == 0 {
+			continue
+		}
+		if key.Desc {
+			return comparison > 0
+		}
+		return comparison < 0
+	}
+	return false
 }
 
 func compare(a, b Record, field SortField) int {

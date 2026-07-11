@@ -46,6 +46,9 @@ func runText(cmd *cobra.Command, c *Config) error {
 		if err != nil {
 			return fmt.Errorf("%q: %w", p, err)
 		}
+		if err := acceptScan(cmd, p, stats, c.AllowPartial); err != nil {
+			return err
+		}
 		if c.Format == outputFormatTSV {
 			if err := render.TSV(out, root, p, topts); err != nil {
 				return fmt.Errorf("render %q: %w", p, err)

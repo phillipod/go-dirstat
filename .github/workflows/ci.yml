@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Run the exact toolchain installed by each lane; do not auto-upgrade from go.mod.
+  GOTOOLCHAIN: local
+
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -31,12 +35,12 @@ jobs:
           - windows-11-arm
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.5'
           cache: true
 
       - name: Verify modules
@@ -51,17 +55,60 @@ jobs:
       - name: Build CLI
         run: go build -trimpath ./cmd/dirstat
 
+  tui-pty:
+    name: TUI PTY / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Build real CLI for terminal smoke
+        shell: bash
+        run: go build -trimpath -o "$RUNNER_TEMP/dirstat-pty" ./cmd/dirstat
+
+      - name: Exercise native terminal lifecycle
+        shell: bash
+        env:
+          DIRSTAT_PTY_BINARY: ${{ runner.temp }}/dirstat-pty
+          DIRSTAT_PTY_ARTIFACT_DIR: ${{ runner.temp }}/dirstat-pty-artifacts
+        run: go test ./cmd/dirstat -run '^TestTUIRealPTYLifecycle$' -count=1 -timeout=60s -v
+
+      - name: Retain terminal transcript
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tui-pty-${{ matrix.os }}
+          path: ${{ runner.temp }}/dirstat-pty-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
   race:
     name: race detector
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.5'
           cache: true
 
       - name: Verify modules
@@ -75,16 +122,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.5'
           cache: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.11.4
           args: --timeout=5m
@@ -94,17 +141,41 @@ jobs:
           golangci-lint config verify
           golangci-lint fmt --diff
 
+  govulncheck:
+    name: govulncheck / Go 1.26.5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up release Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Install govulncheck
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Reject reachable vulnerabilities
+        run: '"$RUNNER_TEMP/bin/govulncheck" ./...'
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Set up stable Go
-        uses: actions/setup-go@v6
+      - name: Set up release Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: stable
+          go-version: '1.26.5'
           cache: true
 
       - name: Install actionlint
@@ -114,3 +185,13 @@ jobs:
 
       - name: Check workflow files
         run: '"$RUNNER_TEMP/bin/actionlint"'
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject newly introduced high-severity dependencies
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high

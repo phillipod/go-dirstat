@@ -16,7 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,14 +29,19 @@ import (
 
 // magicVersion guards against reading foreign or incompatible cache files. If
 // the on-disk layout ever changes, bump formatVersion to invalidate old caches.
-var magicVersion = []byte{'d', 's', 't', 0x02}
+var magicVersion = []byte{'d', 's', 't', 0x03}
 
 // formatVersion is encoded after the magic bytes.
-const formatVersion byte = 1
+const formatVersion byte = 2
+
+const windowsOS = "windows"
 
 // ErrIncompatible is returned when a cache file is the wrong format or was
 // written under a different scope fingerprint.
 var ErrIncompatible = errors.New("cache: incompatible snapshot")
+
+// ErrStale is returned when a valid snapshot exceeds the store TTL.
+var ErrStale = errors.New("cache: stale snapshot")
 
 // Snapshot is the on-disk representation of one scan.
 type Snapshot struct {
@@ -44,7 +52,10 @@ type Snapshot struct {
 	Files       int
 	Dirs        int
 	Errors      int64
-	Nodes       []FlatNode
+	// Complete is an explicit publication invariant. Errors==0 is not enough:
+	// a canceled scan can stop before observing an unreadable entry.
+	Complete bool
+	Nodes    []FlatNode
 }
 
 // FlatNode is one node in the flattened snapshot array.
@@ -62,41 +73,101 @@ type FlatNode struct {
 	Parent    int // index into Nodes, -1 for the root
 }
 
-// Fingerprint returns a short, stable hash of the root path and every scope
-// option that affects scan results. Two scans with the same fingerprint produce
-// interchangeable trees, so a cached snapshot can be reused.
+const fingerprintVersion = "scope-fingerprint-v2"
+
+// Fingerprint returns a versioned SHA-256 hash of the root path and every scope
+// option that affects scan results. Tags and values are length-prefixed, so
+// embedded newlines cannot alias another policy. Two scans with the same
+// fingerprint produce interchangeable trees, so a cached snapshot can be reused.
 func Fingerprint(root string, p scope.Policy) string {
 	h := sha256.New()
-	// hash.Hash writes are specified not to fail; make that explicit while
-	// retaining the readable line-delimited fingerprint layout.
-	_, _ = fmt.Fprintln(h, root)
-	_, _ = fmt.Fprintln(h, p.CrossDevice, p.FollowSymlinks, p.ExcludeVirtual, p.IncludeHidden)
-	_, _ = fmt.Fprintln(h, p.MinSize, p.MaxSize)
-	writeSorted(h, "g", p.ExcludeGlobs)
-	writeSorted(h, "ep", p.ExcludePaths)
-	writeSorted(h, "ip", p.IncludePaths)
-	writeSorted(h, "vp", p.VirtualPaths)
-	writeKeys(h, "ifs", p.IncludeFS)
-	writeKeys(h, "efs", p.ExcludeFS)
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	writeFingerprintField(h, "version", fingerprintVersion)
+	writeFingerprintField(h, "root", root)
+	writeFingerprintField(h, "cross-device", strconv.FormatBool(p.CrossDevice))
+	writeFingerprintField(h, "follow-symlinks", strconv.FormatBool(p.FollowSymlinks))
+	writeFingerprintField(h, "exclude-virtual", strconv.FormatBool(p.ExcludeVirtual))
+	writeFingerprintField(h, "include-hidden", strconv.FormatBool(p.IncludeHidden))
+	writeFingerprintField(h, "min-size", strconv.FormatInt(p.MinSize, 10))
+	writeFingerprintField(h, "max-size", strconv.FormatInt(p.MaxSize, 10))
+	writeSortedFingerprintFields(h, "exclude-glob", p.ExcludeGlobs)
+	writeSortedFingerprintFields(h, "exclude-path", effectiveFingerprintPaths(root, p.ExcludePaths))
+	writeSortedFingerprintFields(h, "include-path", normalizedFingerprintPaths(p.IncludePaths))
+	writeSortedFingerprintFields(h, "virtual-path", effectiveFingerprintPaths(root, p.VirtualPaths))
+	writeFingerprintKeys(h, "include-fs", p.IncludeFS)
+	writeFingerprintKeys(h, "exclude-fs", p.ExcludeFS)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func writeSorted(w io.Writer, tag string, xs []string) {
+func writeFingerprintField(w io.Writer, tag, value string) {
+	// Fixed-width hexadecimal lengths keep the stream portable and
+	// unambiguous while remaining inspectable in a debugger.
+	_, _ = fmt.Fprintf(w, "%016x%s%016x%s", len(tag), tag, len(value), value)
+}
+
+func writeSortedFingerprintFields(w io.Writer, tag string, xs []string) {
 	cp := append([]string(nil), xs...)
 	sort.Strings(cp)
-	for _, s := range cp {
-		_, _ = fmt.Fprintln(w, tag, s)
+	for i, s := range cp {
+		if i > 0 && s == cp[i-1] {
+			continue
+		}
+		writeFingerprintField(w, tag, s)
 	}
 }
 
-func writeKeys(w io.Writer, tag string, m map[string]bool) {
+func normalizedFingerprintPaths(paths []string) []string {
+	candidates := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if strings.TrimSpace(path) != "" {
+			candidates = append(candidates, filepath.Clean(path))
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if len(candidates[i]) == len(candidates[j]) {
+			return candidates[i] < candidates[j]
+		}
+		return len(candidates[i]) < len(candidates[j])
+	})
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		redundant := false
+		for _, parent := range result {
+			relative, err := filepath.Rel(parent, candidate)
+			if err == nil && !filepath.IsAbs(relative) && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				redundant = true
+				break
+			}
+		}
+		if !redundant {
+			result = append(result, candidate)
+		}
+	}
+	return result
+}
+
+func effectiveFingerprintPaths(root string, paths []string) []string {
+	root = filepath.Clean(root)
+	var effective []string
+	for _, candidate := range normalizedFingerprintPaths(paths) {
+		// A subtree filter changes the scan whenever it intersects the scan
+		// root. That includes both a path below root and an ancestor that
+		// suppresses root itself. Scope owns alias normalization, including
+		// missing suffixes below symlinked existing ancestors.
+		if scope.PathsIntersect(root, candidate) {
+			effective = append(effective, candidate)
+		}
+	}
+	return effective
+}
+
+func writeFingerprintKeys(w io.Writer, tag string, m map[string]bool) {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		_, _ = fmt.Fprintln(w, tag, k)
+		writeFingerprintField(w, tag, k)
 	}
 }
 
@@ -104,7 +175,7 @@ func writeKeys(w io.Writer, tag string, m map[string]bool) {
 // Parent indexes and basenames are sufficient to rebuild every relative path;
 // storing the full path per node would make caches disproportionately large on
 // deep or million-entry trees.
-func FromTree(root *tree.Node, fingerprint, rootFS string, files, dirs int, errs int64, at time.Time) *Snapshot {
+func FromTree(root *tree.Node, fingerprint, rootFS string, files, dirs int, errs int64, complete bool, at time.Time) *Snapshot {
 	snap := &Snapshot{
 		Root:        root.Path(), // "" for the root; caller overrides with the absolute path
 		Fingerprint: fingerprint,
@@ -113,6 +184,7 @@ func FromTree(root *tree.Node, fingerprint, rootFS string, files, dirs int, errs
 		Files:       files,
 		Dirs:        dirs,
 		Errors:      errs,
+		Complete:    complete,
 		Nodes:       make([]FlatNode, 0, 64),
 	}
 	type item struct {
@@ -179,17 +251,117 @@ func (s *Snapshot) validTreeLayout() bool {
 		s.Nodes[0].Parent != -1 || s.Nodes[0].Depth != 0 {
 		return false
 	}
+	root := s.Nodes[0]
+	if root.Name != filepath.Base(s.Root) {
+		return false
+	}
+	if root.Hardlink {
+		return false
+	}
+	if root.IsDir {
+		if s.Dirs < 1 || root.FileCount != s.Files || root.DirCount != s.Dirs-1 {
+			return false
+		}
+	} else if len(s.Nodes) != 1 || s.Files != 1 || s.Dirs != 0 || root.FileCount != 0 || root.DirCount != 0 {
+		return false
+	}
+	siblings := make(map[int]map[string]bool)
+	fileNodes, dirNodes := 0, 0
+	var errorNodes int64
 	for i := range s.Nodes {
 		node := s.Nodes[i]
 		if node.Depth < 0 || node.Apparent < 0 || node.Alloc < 0 || node.FileCount < 0 || node.DirCount < 0 {
 			return false
 		}
 		if i == 0 {
+			if node.IsDir {
+				dirNodes++
+			} else {
+				fileNodes++
+			}
+			if node.ErrMsg != "" {
+				errorNodes++
+			}
+			if node.Hardlink && (node.IsDir || node.Apparent != 0 || node.Alloc != 0) {
+				return false
+			}
 			continue
+		}
+		if node.Name == "" || node.Name == "." || node.Name == ".." || strings.ContainsRune(node.Name, '\x00') ||
+			strings.ContainsAny(node.Name, `/\`) || filepath.IsAbs(node.Name) {
+			return false
 		}
 		parent := node.Parent
 		if parent < 0 || parent >= i || !s.Nodes[parent].IsDir || node.Depth != s.Nodes[parent].Depth+1 {
 			return false
+		}
+		if siblings[parent] == nil {
+			siblings[parent] = make(map[string]bool)
+		}
+		nameKey := node.Name
+		if runtime.GOOS == windowsOS {
+			nameKey = strings.ToLower(nameKey)
+		}
+		if siblings[parent][nameKey] {
+			return false
+		}
+		siblings[parent][nameKey] = true
+		if node.IsDir {
+			dirNodes++
+		} else {
+			if node.ErrMsg == "" {
+				fileNodes++
+			}
+		}
+		if node.ErrMsg != "" {
+			errorNodes++
+		}
+		if node.Hardlink && (node.IsDir || node.Apparent != 0 || node.Alloc != 0) {
+			return false
+		}
+	}
+	if dirNodes != s.Dirs || fileNodes != s.Files || errorNodes != s.Errors || (s.Complete && s.Errors != 0) {
+		return false
+	}
+	childApparent := make([]int64, len(s.Nodes))
+	childAllocated := make([]int64, len(s.Nodes))
+	childFiles := make([]int, len(s.Nodes))
+	childDirs := make([]int, len(s.Nodes))
+	childNewest := make([]time.Time, len(s.Nodes))
+	for i := len(s.Nodes) - 1; i >= 0; i-- {
+		node := s.Nodes[i]
+		if !node.IsDir {
+			if node.FileCount != 0 || node.DirCount != 0 {
+				return false
+			}
+		} else if node.Apparent != childApparent[i] || node.Alloc < childAllocated[i] ||
+			node.FileCount != childFiles[i] || node.DirCount != childDirs[i] ||
+			(!childNewest[i].IsZero() && node.ModTime.Before(childNewest[i])) {
+			return false
+		}
+		parent := node.Parent
+		if parent < 0 {
+			continue
+		}
+		if childApparent[parent] > 1<<63-1-node.Apparent || childAllocated[parent] > 1<<63-1-node.Alloc {
+			return false
+		}
+		childApparent[parent] += node.Apparent
+		childAllocated[parent] += node.Alloc
+		if node.ModTime.After(childNewest[parent]) {
+			childNewest[parent] = node.ModTime
+		}
+		if node.IsDir {
+			if node.FileCount > int(^uint(0)>>1)-childFiles[parent] || node.DirCount >= int(^uint(0)>>1)-childDirs[parent] {
+				return false
+			}
+			childFiles[parent] += node.FileCount
+			childDirs[parent] += node.DirCount + 1
+		} else if node.ErrMsg == "" {
+			if childFiles[parent] == int(^uint(0)>>1) {
+				return false
+			}
+			childFiles[parent]++
 		}
 	}
 	return true
@@ -219,27 +391,46 @@ func (s *Snapshot) Marshal() ([]byte, error) {
 
 // Unmarshal decodes a snapshot, rejecting wrong magic/version/fingerprint.
 func Unmarshal(data []byte, wantFingerprint string) (*Snapshot, error) {
-	r := bytes.NewReader(data)
-	magic := make([]byte, len(magicVersion))
-	if _, err := io.ReadFull(r, magic); err != nil {
-		return nil, ErrIncompatible
-	}
-	if !bytes.Equal(magic, magicVersion) {
-		return nil, ErrIncompatible
-	}
-	ver, err := r.ReadByte()
-	if err != nil || ver != formatVersion {
-		return nil, ErrIncompatible
-	}
-	var snap Snapshot
-	if err := gob.NewDecoder(r).Decode(&snap); err != nil {
+	snap, current, err := Inspect(data)
+	if err != nil || !current {
 		return nil, ErrIncompatible
 	}
 	if strings.TrimSpace(wantFingerprint) != "" && snap.Fingerprint != wantFingerprint {
 		return nil, ErrIncompatible
 	}
-	if !snap.validTreeLayout() {
-		return nil, ErrIncompatible
+	return snap, nil
+}
+
+// Inspect validates current and recognized legacy snapshot encodings for
+// explicit migration. Legacy snapshots are never returned by Load/Unmarshal;
+// callers may only inventory or invalidate them.
+func Inspect(data []byte) (*Snapshot, bool, error) {
+	r := bytes.NewReader(data)
+	magic := make([]byte, len(magicVersion))
+	if _, err := io.ReadFull(r, magic); err != nil {
+		return nil, false, ErrIncompatible
 	}
-	return &snap, nil
+	current := bytes.Equal(magic, magicVersion)
+	legacy := bytes.Equal(magic, []byte{'d', 's', 't', 0x02})
+	if !current && !legacy {
+		return nil, false, ErrIncompatible
+	}
+	ver, err := r.ReadByte()
+	if err != nil || (current && ver != formatVersion) || (legacy && ver != 1) {
+		return nil, false, ErrIncompatible
+	}
+	var snap Snapshot
+	decoder := gob.NewDecoder(r)
+	if err := decoder.Decode(&snap); err != nil {
+		return nil, false, ErrIncompatible
+	}
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, false, ErrIncompatible
+	}
+	if strings.TrimSpace(snap.Root) == "" || !filepath.IsAbs(snap.Root) || strings.TrimSpace(snap.Fingerprint) == "" ||
+		snap.ScannedAt.IsZero() || !snap.validTreeLayout() {
+		return nil, false, ErrIncompatible
+	}
+	return &snap, current, nil
 }

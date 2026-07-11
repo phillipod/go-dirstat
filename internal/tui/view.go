@@ -45,6 +45,10 @@ func (m *model) View() string {
 			body = m.extBody()
 		case viewLargest:
 			body = m.topBody()
+		case viewGrowth:
+			body = m.growthBody()
+		case viewOpenDeleted:
+			body = m.openDeletedBody()
 		case viewHelp:
 			body = m.helpBody()
 		default:
@@ -77,8 +81,13 @@ func (m *model) headerView() string {
 		badges = append(badges, dimStyle.Render("sort:"+m.extSort.String()), dimStyle.Render(modeLabel(m.sizeMode)))
 	case viewLargest:
 		badges = append(badges, dimStyle.Render("top:100"), dimStyle.Render(modeLabel(m.sizeMode)))
+	case viewGrowth:
+		badges = append(badges, dimStyle.Render("history"))
+	case viewOpenDeleted:
+		badges = append(badges, dimStyle.Render("unique objects"))
 	case viewHelp:
 	}
+	badges = append(badges, m.pressureBadges()...)
 	if m.scanning {
 		badges = append(badges, badgeStyle.Render("scanning…"))
 	}
@@ -120,6 +129,15 @@ func (m *model) footerView() string {
 		}
 		return truncate(line1, m.width) + "\n" + truncate(helpStyle.Render(m.managementHelp()), m.width)
 	}
+	if m.targeting {
+		current := formatVolumeBytes(m.targetAvailable)
+		line1 := dimStyle.Render("Current reclaim target: " + current)
+		if m.managementError != "" {
+			line1 = errStyle.Render(m.managementError)
+		}
+		return truncate(line1, m.width) + "\n" +
+			truncate(helpStyle.Render("target available: "+m.targetInput+"█  Enter apply · supports B/K/M/G/T/P/E · Esc cancel"), m.width)
+	}
 	if m.managementError != "" {
 		return truncate(errStyle.Render(m.managementError), m.width) + "\n" + truncate(helpStyle.Render("F3 preview · F4 edit · F5 copy · F6 move · F7 mkdir · F8 delete · a review"), m.width)
 	}
@@ -135,6 +153,10 @@ func (m *model) footerView() string {
 		keys = "↑/↓ move · / search · t tree · f files · s sort · m mode · r rescan · ? help · q quit"
 	case viewLargest:
 		keys = "↑/↓ move · Space mark · / search · i inspect · F8 delete · t/e views · ? help"
+	case viewGrowth:
+		keys = "↑/↓ move · r refresh/record · c cancel · O open-deleted · T target · Tab views · ? help"
+	case viewOpenDeleted:
+		keys = "↑/↓ move · r refresh · c cancel · Y growth · T target · Tab views · ? help"
 	case viewHelp:
 	}
 	line2 := helpStyle.Render(keys)
@@ -148,23 +170,47 @@ func (m *model) managementBody() string {
 	case managementNone:
 		return "Esc close"
 	case managementDestination:
-		lines = append(lines, fmt.Sprintf("%s %d selected path(s)", m.managementAction, len(m.actionPaths())), "", "Destination:", m.managementInput+"█")
+		return m.destinationBody()
 	case managementMkdir:
 		lines = append(lines, "Create directory", "", "Path (relative to scan root or absolute):", m.managementInput+"█")
+	case managementExport:
+		lines = append(lines, "Export guarded queue", "", "Plan path (relative to scan root or absolute):", m.managementInput+"█")
 	case managementReview:
 		if len(m.queue) == 0 {
 			lines = append(lines, dimStyle.Render("Queue is empty."))
 			break
 		}
-		for i, op := range m.queue {
+		page := m.reviewPageSize()
+		start := min(max(0, m.managementOffset), len(m.queue)-1)
+		end := min(len(m.queue), start+page)
+		dryRunStatus := "dry-run not run"
+		if m.managementDryRun {
+			dryRunStatus = "dry-run passed"
+		}
+		lines = append(lines,
+			fmt.Sprintf("Queued %d operation(s) · reclaim up to %s", len(m.queue), format.Bytes(m.queuedReclaimBytes())),
+			dimStyle.Render(fmt.Sprintf("Showing %d-%d of %d · reviewed %d/%d · %s", start+1, end, len(m.queue), m.managementSeen, len(m.queue), dryRunStatus)),
+		)
+		for i := start; i < end; i++ {
+			op := m.queue[i]
 			line := fmt.Sprintf("%2d  %-7s %s", i+1, op.Action, format.SafeText(op.Source))
 			if op.Destination != "" {
 				line += " → " + format.SafeText(op.Destination)
 			}
-			lines = append(lines, truncate(line, w))
+			line = truncate(line, w)
+			if i == m.managementCursor {
+				line = cursorBg.Render(line)
+			}
+			lines = append(lines, line)
 		}
+	case managementDryRun:
+		lines = append(lines, badgeStyle.Render(fmt.Sprintf("Dry-running %d guarded operation(s)…", len(m.queue))), "", dimStyle.Render("No filesystem changes or audit records are written."))
 	case managementConfirm:
-		lines = append(lines, errStyle.Render(fmt.Sprintf("Apply %d guarded operation(s)?", len(m.queue))), "", "Type APPLY exactly:", m.managementInput+"█")
+		dryRunStatus := "dry-run not run"
+		if m.managementDryRun {
+			dryRunStatus = "dry-run passed"
+		}
+		lines = append(lines, errStyle.Render(fmt.Sprintf("Apply %d guarded operation(s)?", len(m.queue))), dimStyle.Render(dryRunStatus), "", "Type APPLY exactly:", m.managementInput+"█")
 	case managementApplying:
 		lines = append(lines, badgeStyle.Render(fmt.Sprintf("Applying %d operation(s)…", len(m.queue))), "", dimStyle.Render("Each source is revalidated against its captured identity, size, and modification time."))
 	case managementResult:
@@ -176,6 +222,13 @@ func (m *model) managementBody() string {
 			lines = append(lines, badgeStyle.Render(status))
 		} else {
 			lines = append(lines, errStyle.Render("Apply stopped: "+format.SafeText(m.managementError)))
+			if partial := partialMutationCount(m.applyResults); partial > 0 {
+				status := fmt.Sprintf("%d operation(s) may have changed disk; reconciliation is required.", partial)
+				if m.scanning {
+					status = fmt.Sprintf("%d operation(s) may have changed disk; reconciling in the background.", partial)
+				}
+				lines = append(lines, errStyle.Render(status))
+			}
 			if successfulApplyCount(m.applyResults) > 0 {
 				status := "Successful changes are reflected in the current view."
 				if m.scanning {
@@ -186,6 +239,12 @@ func (m *model) managementBody() string {
 		}
 		for _, result := range m.applyResults {
 			line := fmt.Sprintf("%-7s %-7s %s", result.Status, result.Action, result.OperationID)
+			if result.MutationCompleted {
+				line += " · mutation completed"
+			}
+			if result.AuditStatus != "" {
+				line += " · audit:" + result.AuditStatus
+			}
 			if result.Error != "" {
 				line += " · " + format.SafeText(result.Error)
 			}
@@ -194,6 +253,9 @@ func (m *model) managementBody() string {
 	}
 	if m.managementError != "" && m.management != managementResult {
 		lines = append(lines, "", errStyle.Render(format.SafeText(m.managementError)))
+	}
+	if m.managementNote != "" {
+		lines = append(lines, "", dimStyle.Render(format.SafeText(m.managementNote)))
 	}
 	if len(lines) > m.availHeight() {
 		lines = lines[:m.availHeight()]
@@ -207,7 +269,17 @@ func (m *model) managementBody() string {
 func successfulApplyCount(results []fsops.Result) int {
 	count := 0
 	for _, result := range results {
-		if result.Status == "ok" && !result.DryRun {
+		if result.Status == fsops.ResultStatusOK && !result.DryRun {
+			count++
+		}
+	}
+	return count
+}
+
+func partialMutationCount(results []fsops.Result) int {
+	count := 0
+	for _, result := range results {
+		if resultIndicatesPartialMutation(result) {
 			count++
 		}
 	}
@@ -218,10 +290,15 @@ func (m *model) managementHelp() string {
 	switch m.management {
 	case managementNone:
 		return ""
-	case managementDestination, managementMkdir, managementConfirm:
+	case managementDestination, managementMkdir, managementExport, managementConfirm:
+		if m.management == managementDestination && strings.TrimSpace(m.managementInput) == "" {
+			return destinationHelp()
+		}
 		return "Enter continue · Esc cancel"
 	case managementReview:
-		return "Enter apply · d discard queue · Esc return"
+		return "↑/↓ PgUp/PgDn review · x remove · [/] reorder · v dry-run · e export · Enter apply · d discard"
+	case managementDryRun:
+		return "Esc cancel dry-run"
 	case managementApplying:
 		return "Esc cancel between entries"
 	case managementResult:
@@ -255,6 +332,9 @@ func (m *model) detailLine() string {
 		}
 		return dimStyle.Render(fmt.Sprintf("%s · %s · %.1f%% of total",
 			format.SafeText(path), format.Bytes(r.file.Size(m.sizeMode)), r.pct))
+	}
+	if m.view == viewGrowth || m.view == viewOpenDeleted {
+		return m.analysisDetailLine()
 	}
 	return ""
 }
@@ -414,14 +494,14 @@ func (m *model) helpBody() string {
 	rows := []struct{ key, desc string }{
 		{"↑/↓ or k/j", "move selection"},
 		{"Enter / l", "expand or collapse directory"},
-		{"Space", "mark or unmark selected path"},
+		{"Space / Ctrl+X", "mark or unmark selected path / clear all marks"},
 		{"/ / Ctrl+L", "search paths / clear filter"},
 		{"i / p", "toggle metadata/content context pane"},
 		{"F3 / F4", "preview pane / configured external editor"},
 		{"o / !", "configured pager / shell in selected directory"},
 		{"F5 / F6", "queue guarded copy / move"},
 		{"F7 / F8", "queue mkdir / staged delete"},
-		{"a", "review queue and apply with typed confirmation"},
+		{"a", "review, edit, dry-run, export, or apply the queue"},
 		{"h / ←", "collapse, or jump to parent"},
 		{"g / G", "jump to top / bottom"},
 		{"PgUp/PgDn", "scroll by a page"},
@@ -430,6 +510,8 @@ func (m *model) helpBody() string {
 		{"m", "toggle on-disk / apparent size"},
 		{"e / t", "extensions view / tree view"},
 		{"f", "largest files view (top 100)"},
+		{"Y / O", "growth history / unique open-deleted pressure"},
+		{"T", "set caller-available reclaim target"},
 		{"Tab / Shift+Tab", "cycle views forward / backward"},
 		{"r", "rescan (force refresh)"},
 		{"c / Esc", "stop active scan; retain current results"},
@@ -484,6 +566,9 @@ func (m *model) absoluteNodePath(n *tree.Node) string {
 
 func (m *model) contextBody() string {
 	w := m.contextWidth()
+	if m.view == viewGrowth || m.view == viewOpenDeleted {
+		return m.analysisContextBody(w)
+	}
 	if m.view == viewExt {
 		return truncate(titleStyle.Render("Extension analysis"), w) + "\n\n" + truncate(m.detailLine(), w)
 	}
@@ -549,10 +634,14 @@ func viewName(v viewMode) string {
 		return "extensions"
 	case viewLargest:
 		return "largest files"
+	case viewGrowth:
+		return "growth"
+	case viewOpenDeleted:
+		return "open-deleted"
 	case viewHelp:
 		return "help"
 	default:
-		return "unknown"
+		return unknownLabel
 	}
 }
 

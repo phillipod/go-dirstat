@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -18,11 +20,15 @@ import (
 
 type managementMode int
 
+type applyPlanFunc func(context.Context, fsops.Plan, fsops.ApplyOptions) ([]fsops.Result, error)
+
 const (
 	managementNone managementMode = iota
 	managementDestination
 	managementMkdir
 	managementReview
+	managementExport
+	managementDryRun
 	managementConfirm
 	managementApplying
 	managementResult
@@ -43,21 +49,23 @@ func (m *model) actionPaths() []string {
 	return paths
 }
 
-func (m *model) startInput(action fsops.Action) {
+func (m *model) startInput(action fsops.Action) tea.Cmd {
 	if m.app.opts.ReadOnly {
 		m.managementError = "read-only mode: filesystem actions are disabled"
-		return
+		return nil
 	}
 	if len(m.actionPaths()) == 0 {
 		m.managementError = "no path selected"
-		return
+		return nil
 	}
 	m.managementAction, m.managementInput, m.managementError = action, "", ""
 	if action == fsops.ActionMkdir {
 		m.management = managementMkdir
-	} else {
-		m.management = managementDestination
+		return nil
 	}
+	m.management = managementDestination
+	m.destination = destinationPickerState{path: m.rootAbs}
+	return m.startDestinationPicker()
 }
 
 func (m *model) stageDelete() tea.Cmd {
@@ -100,7 +108,7 @@ func (m *model) stageCmd(action fsops.Action, paths []string, destination string
 				return stagedMsg{err: fmt.Errorf("inspect %q: %w", path, err)}
 			}
 			op := fsops.Operation{ID: fmt.Sprintf("tui-%d", startID+uint64(i)+1), Action: action, Source: path, Expected: &entry}
-			if action == fsops.ActionDelete && entry.Kind == "directory" {
+			if action == fsops.ActionDelete && entry.Kind == kindDirectory {
 				op.Recursive = true
 			}
 			if action == fsops.ActionCopy || action == fsops.ActionMove {
@@ -119,14 +127,271 @@ func (m *model) stageCmd(action fsops.Action, paths []string, destination string
 	}
 }
 
+func normalizeAndValidateQueue(root string, operations []fsops.Operation) ([]fsops.Operation, error) {
+	normalized := make([]fsops.Operation, 0, len(operations))
+	seenOperation := make(map[string]bool, len(operations))
+	seenID := make(map[string]bool, len(operations))
+	for _, op := range operations {
+		if strings.TrimSpace(op.ID) == "" {
+			return nil, errors.New("queued operation ID is required")
+		}
+		if seenID[op.ID] {
+			return nil, fmt.Errorf("duplicate queued operation ID %q", op.ID)
+		}
+		seenID[op.ID] = true
+		if strings.TrimSpace(op.Source) == "" || !filepath.IsAbs(op.Source) {
+			return nil, fmt.Errorf("operation %q has a non-absolute source", op.ID)
+		}
+		op.Source = filepath.Clean(op.Source)
+		if !filesystemPathContains(root, op.Source) {
+			return nil, fmt.Errorf("operation %q source escapes the scan root", op.ID)
+		}
+		if filesystemPathEqual(root, op.Source) &&
+			(op.Action == fsops.ActionDelete || op.Action == fsops.ActionMove || op.Action == fsops.ActionRename) {
+			return nil, fmt.Errorf("operation %q cannot mutate the scan root itself", op.ID)
+		}
+		if op.Destination != "" {
+			if !filepath.IsAbs(op.Destination) {
+				return nil, fmt.Errorf("operation %q has a non-absolute destination", op.ID)
+			}
+			op.Destination = filepath.Clean(op.Destination)
+			if !filesystemPathContains(root, op.Destination) {
+				return nil, fmt.Errorf("operation %q destination escapes the scan root", op.ID)
+			}
+		}
+		key := string(op.Action) + "\x00" + queuePathKey(op.Source) + "\x00" + queuePathKey(op.Destination)
+		if seenOperation[key] {
+			continue
+		}
+		seenOperation[key] = true
+		normalized = append(normalized, op)
+	}
+
+	// A recursive parent deletion subsumes queued descendant deletions. Collapse
+	// them independent of staging order so reclaim totals and apply results are
+	// deterministic.
+	keep := make([]bool, len(normalized))
+	for i := range keep {
+		keep[i] = true
+	}
+	for i, parent := range normalized {
+		if parent.Action != fsops.ActionDelete || !parent.Recursive {
+			continue
+		}
+		for j, child := range normalized {
+			if i != j && child.Action == fsops.ActionDelete && queuePathContains(parent.Source, child.Source) {
+				keep[j] = false
+			}
+		}
+	}
+	compacted := normalized[:0]
+	for i, op := range normalized {
+		if keep[i] {
+			compacted = append(compacted, op)
+		}
+	}
+	normalized = compacted
+
+	destinations := make(map[string]string, len(normalized))
+	for i, left := range normalized {
+		if target := queuedOperationTarget(left); target != "" {
+			if left.Destination != "" && queuePathKey(target) == queuePathKey(left.Source) {
+				return nil, fmt.Errorf("operation %q has the same source and destination %q", left.ID, target)
+			}
+			if left.Destination != "" && queuePathContains(left.Source, target) {
+				return nil, fmt.Errorf("operation %q targets a descendant of its source", left.ID)
+			}
+			key := queuePathKey(target)
+			if prior, exists := destinations[key]; exists {
+				return nil, fmt.Errorf("queued operations %q and %q target the same destination %q", prior, left.ID, target)
+			}
+			destinations[key] = left.ID
+		}
+		for j := i + 1; j < len(normalized); j++ {
+			right := normalized[j]
+			if queuePathKey(left.Source) == queuePathKey(right.Source) &&
+				(left.Action != fsops.ActionCopy || right.Action != fsops.ActionCopy) {
+				return nil, fmt.Errorf("queued operations %q and %q conflict on source %q", left.ID, right.ID, left.Source)
+			}
+			leftContainsRight := queuePathContains(left.Source, right.Source)
+			rightContainsLeft := queuePathContains(right.Source, left.Source)
+			if (leftContainsRight || rightContainsLeft) &&
+				(left.Action == fsops.ActionDelete || left.Action == fsops.ActionMove || left.Action == fsops.ActionRename ||
+					right.Action == fsops.ActionDelete || right.Action == fsops.ActionMove || right.Action == fsops.ActionRename) {
+				return nil, fmt.Errorf("queued operations %q and %q have conflicting ancestor sources", left.ID, right.ID)
+			}
+		}
+	}
+	for _, op := range normalized {
+		target := queuedOperationTarget(op)
+		if target == "" {
+			continue
+		}
+		for _, other := range normalized {
+			if other.Action == fsops.ActionDelete && queuePathContains(other.Source, target) {
+				return nil, fmt.Errorf("operation %q targets %q inside queued deletion %q", op.ID, target, other.Source)
+			}
+			if other.ID != op.ID && queuePathKey(target) == queuePathKey(other.Source) {
+				return nil, fmt.Errorf("operation %q targets source %q used by operation %q", op.ID, target, other.ID)
+			}
+		}
+	}
+	return normalized, nil
+}
+
+func queuedOperationTarget(op fsops.Operation) string {
+	if op.Destination != "" {
+		return op.Destination
+	}
+	if op.Action == fsops.ActionMkdir || op.Action == fsops.ActionTouch {
+		return op.Source
+	}
+	return ""
+}
+
+func queuePathKey(path string) string {
+	path = filepath.Clean(path)
+	if runtime.GOOS == windowsOS {
+		return strings.ToLower(path)
+	}
+	return path
+}
+
+func queuePathContains(parent, child string) bool {
+	if queuePathKey(parent) == queuePathKey(child) {
+		return false
+	}
+	relative, err := filepath.Rel(parent, child)
+	return err == nil && relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
 func (m *model) applyCmd() tea.Cmd {
+	return m.runPlanCmd(false)
+}
+
+func (m *model) dryRunCmd() tea.Cmd {
+	return m.runPlanCmd(true)
+}
+
+func (m *model) runPlanCmd(dryRun bool) tea.Cmd {
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.applyCancel = cancel
-	plan := fsops.Plan{Header: fsops.PlanHeader{Version: fsops.PlanVersion, Root: m.rootAbs, CreatedAt: time.Now().UTC()}, Operations: append([]fsops.Operation(nil), m.queue...)}
+	plan := m.operationPlan()
+	apply := fsops.Apply
+	if m.app.applyPlan != nil {
+		apply = m.app.applyPlan
+	}
 	return func() tea.Msg {
-		results, err := fsops.Apply(ctx, plan, fsops.ApplyOptions{AuditPath: m.app.opts.AuditPath, DisableAudit: m.app.opts.DisableAudit})
+		results, err := apply(ctx, plan, fsops.ApplyOptions{
+			DryRun: dryRun, AuditPath: m.app.opts.AuditPath,
+			DisableAudit: dryRun || m.app.opts.DisableAudit,
+		})
+		if dryRun {
+			return dryRunMsg{results: results, err: err}
+		}
 		return appliedMsg{results: results, err: err}
 	}
+}
+
+func (m *model) operationPlan() fsops.Plan {
+	return fsops.Plan{
+		Header:     fsops.PlanHeader{Version: fsops.PlanVersion, Root: m.rootAbs, CreatedAt: time.Now().UTC()},
+		Operations: append([]fsops.Operation(nil), m.queue...),
+	}
+}
+
+func (m *model) exportPlanCmd(path string) tea.Cmd {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(m.rootAbs, path)
+	}
+	path = filepath.Clean(path)
+	plan := m.operationPlan()
+	return func() tea.Msg {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return exportedPlanMsg{path: path, err: err}
+		}
+		keep := false
+		defer func() {
+			_ = file.Close()
+			if !keep {
+				_ = os.Remove(path)
+			}
+		}()
+		if err := fsops.WritePlan(file, plan); err != nil {
+			return exportedPlanMsg{path: path, err: err}
+		}
+		if err := file.Sync(); err != nil {
+			return exportedPlanMsg{path: path, err: err}
+		}
+		if err := file.Close(); err != nil {
+			return exportedPlanMsg{path: path, err: err}
+		}
+		keep = true
+		return exportedPlanMsg{path: path}
+	}
+}
+
+func (m *model) resetQueueReview() {
+	m.managementCursor = 0
+	m.managementOffset = 0
+	m.managementSeen = min(len(m.queue), m.reviewPageSize())
+	m.managementDryRun = false
+	m.managementNote = ""
+}
+
+func (m *model) reviewPageSize() int {
+	return max(1, m.availHeight()-6)
+}
+
+func (m *model) clampQueueReview() {
+	if len(m.queue) == 0 {
+		m.managementCursor, m.managementOffset, m.managementSeen = 0, 0, 0
+		return
+	}
+	m.managementCursor = min(max(0, m.managementCursor), len(m.queue)-1)
+	page := m.reviewPageSize()
+	maxOffset := max(0, len(m.queue)-page)
+	if m.managementCursor < m.managementOffset {
+		m.managementOffset = m.managementCursor
+	}
+	if m.managementCursor >= m.managementOffset+page {
+		m.managementOffset = m.managementCursor - page + 1
+	}
+	m.managementOffset = min(max(0, m.managementOffset), maxOffset)
+	visibleEnd := min(len(m.queue), m.managementOffset+page)
+	if m.managementOffset <= m.managementSeen {
+		m.managementSeen = max(m.managementSeen, visibleEnd)
+	}
+}
+
+func (m *model) moveQueueCursor(delta int) {
+	m.managementCursor += delta
+	m.clampQueueReview()
+}
+
+func (m *model) removeQueuedOperation() {
+	if len(m.queue) == 0 {
+		return
+	}
+	i := m.managementCursor
+	m.queue = append(m.queue[:i], m.queue[i+1:]...)
+	m.resetQueueReview()
+	m.managementNote = "Removed queued operation; review and dry-run state reset."
+}
+
+func (m *model) reorderQueuedOperation(delta int) {
+	to := m.managementCursor + delta
+	if to < 0 || to >= len(m.queue) {
+		return
+	}
+	m.queue[m.managementCursor], m.queue[to] = m.queue[to], m.queue[m.managementCursor]
+	m.resetQueueReview()
+	m.managementNote = "Queue order changed; review and dry-run state reset."
+}
+
+func (m *model) queuedReclaimBytes() int64 {
+	return m.queueReclaimBytes(m.queue)
 }
 
 func (m *model) externalEditorCmd() tea.Cmd {
@@ -217,5 +482,5 @@ func (m *model) closeManagement() {
 		m.applyCancel()
 		m.applyCancel = nil
 	}
-	m.management, m.managementInput, m.managementError = managementNone, "", ""
+	m.management, m.managementInput, m.managementError, m.managementNote = managementNone, "", "", ""
 }

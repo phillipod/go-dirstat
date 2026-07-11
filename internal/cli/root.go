@@ -2,8 +2,11 @@ package cli
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/phillipod/go-dirstat/internal/version"
 )
@@ -36,6 +39,9 @@ revalidate source metadata, and run only with the caller's privileges.`,
 		SilenceUsage:  true,
 		Version:       version.Info(),
 	}
+	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		return validateScanFlagUse(root, cmd)
+	}
 	root.SetVersionTemplate("dirstat {{.Version}}\n")
 	bindFlags(root, cfg)
 
@@ -46,11 +52,49 @@ revalidate source metadata, and run only with the caller's privileges.`,
 	root.AddCommand(newQueryCommand(cfg))
 	root.AddCommand(newDiagnoseCommand())
 	root.AddCommand(newHistoryCommand(cfg))
+	root.AddCommand(newStateCommand())
 	root.AddCommand(newPlanCommand())
 	root.AddCommand(newApplyCommand())
 	root.AddCommand(newSkillsCommand())
 	root.AddCommand(newVersionCmd())
 	return root
+}
+
+func validateScanFlagUse(root, command *cobra.Command) error {
+	allowed := allScanFlagsAllowed(root, command)
+	var irrelevant []string
+	root.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+		resolved := command.Flags().Lookup(flag.Name)
+		if resolved != nil && resolved.Changed && !allowed[flag.Name] {
+			irrelevant = append(irrelevant, "--"+flag.Name)
+		}
+	})
+	if len(irrelevant) == 0 {
+		return nil
+	}
+	sort.Strings(irrelevant)
+	return fmt.Errorf("scan flag(s) %s are not valid for %q", strings.Join(irrelevant, ", "), command.CommandPath())
+}
+
+func allScanFlagsAllowed(root, command *cobra.Command) map[string]bool {
+	allowed := make(map[string]bool)
+	allowAll := command == root || command.Name() == "tui" || command.Name() == "extensions" || command.Name() == "query"
+	if allowAll {
+		root.PersistentFlags().VisitAll(func(flag *pflag.Flag) { allowed[flag.Name] = true })
+		return allowed
+	}
+	if command.Parent() == nil || command.Parent().Name() != "history" {
+		return allowed
+	}
+	// Both history commands derive a scope fingerprint. Growth also performs a
+	// scan and therefore consumes the worker limit. Size mode does not affect a
+	// snapshot because history records both apparent and allocated bytes.
+	root.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+		if flag.Name != "apparent" && (flag.Name != "jobs" || command.Name() == "growth") {
+			allowed[flag.Name] = true
+		}
+	})
+	return allowed
 }
 
 // bindFlags attaches every flag to cfg. Persistent flags are inherited by
@@ -83,6 +127,7 @@ func bindFlags(root *cobra.Command, cfg *Config) {
 	f.BoolVarP(&cfg.ByExt, "by-ext", "e", false, "show a by-extension breakdown instead of the tree")
 	f.BoolVarP(&cfg.Files, "files", "a", false, "list individual files too (du -a); default shows directories only")
 	f.StringVar(&cfg.Format, "format", "text", "output format: text|tsv")
+	f.BoolVar(&cfg.AllowPartial, "allow-partial", false, "render an incomplete scan and warn instead of exiting with status 3")
 	bindRichOutputFlags(root, cfg)
 }
 
@@ -92,6 +137,10 @@ func bindRichOutputFlags(cmd *cobra.Command, cfg *Config) {
 	f.BoolVar(&cfg.NoBar, "no-bar", false, "hide proportional bars")
 	f.BoolVar(&cfg.NoCol, "no-color", false, "disable ANSI color (auto-disabled when piping)")
 	f.BoolVar(&cfg.NoCt, "no-counts", false, "hide file/dir counts")
+}
+
+func bindAllowPartialFlag(cmd *cobra.Command, cfg *Config) {
+	cmd.Flags().BoolVar(&cfg.AllowPartial, "allow-partial", false, "render an incomplete scan and warn instead of exiting with status 3")
 }
 
 func newVersionCmd() *cobra.Command {

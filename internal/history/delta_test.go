@@ -46,11 +46,63 @@ func TestCompareClassifiesPathChanges(t *testing.T) {
 			t.Errorf("%s change = %q, want %q", path, got[path].Change, change)
 		}
 	}
+	if got[root].Depth != 0 || got[filepath.Join(root, "grow")].Depth != 1 {
+		t.Fatalf("delta depths: root=%d child=%d", got[root].Depth, got[filepath.Join(root, "grow")].Depth)
+	}
 	if got[filepath.Join(root, "shrink")].AllocatedDelta != -30 {
 		t.Errorf("shrink delta = %d", got[filepath.Join(root, "shrink")].AllocatedDelta)
 	}
 	if got[filepath.Join(root, "gone")].AfterAlloc != 0 {
 		t.Errorf("removed after = %d", got[filepath.Join(root, "gone")].AfterAlloc)
+	}
+}
+
+func TestFilterDeltasControlsKindDepthLeafAndLimit(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "srv", "data")
+	deltas := []Delta{
+		{Path: root, IsDir: true},
+		{Path: filepath.Join(root, "sub"), IsDir: true},
+		{Path: filepath.Join(root, "sub", "file")},
+		{Path: filepath.Join(root, "sibling")},
+	}
+	directories, err := FilterDeltas(deltas, root, DeltaFilter{Kind: DeltaKindDirectory, MaxDepth: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(directories) != 2 || !directories[0].IsDir || !directories[1].IsDir {
+		t.Fatalf("directory deltas = %#v", directories)
+	}
+	leaves, err := FilterDeltas(deltas, root, DeltaFilter{Kind: DeltaKindAll, MaxDepth: -1, LeafOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leaves) != 2 || leaves[0].Path != filepath.Join(root, "sub", "file") || leaves[1].Path != filepath.Join(root, "sibling") {
+		t.Fatalf("leaf deltas = %#v", leaves)
+	}
+	shallow, err := FilterDeltas(deltas, root, DeltaFilter{Kind: DeltaKindAll, MaxDepth: 1, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shallow) != 2 || shallow[0].Depth != 0 || shallow[1].Depth != 1 {
+		t.Fatalf("shallow limited deltas = %#v", shallow)
+	}
+}
+
+func TestFilterDeltasRejectsInvalidControlsAndEscapingPaths(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "srv", "data")
+	tests := []struct {
+		deltas []Delta
+		filter DeltaFilter
+	}{
+		{filter: DeltaFilter{Kind: "socket", MaxDepth: -1}},
+		{filter: DeltaFilter{Kind: DeltaKindAll, MaxDepth: -2}},
+		{filter: DeltaFilter{Kind: DeltaKindAll, MaxDepth: -1, Limit: -1}},
+		{deltas: []Delta{{Path: filepath.Dir(root)}}, filter: DeltaFilter{Kind: DeltaKindAll, MaxDepth: -1}},
+	}
+	for _, test := range tests {
+		if _, err := FilterDeltas(test.deltas, root, test.filter); err == nil {
+			t.Fatalf("FilterDeltas(%#v, %#v) unexpectedly succeeded", test.deltas, test.filter)
+		}
 	}
 }
 
