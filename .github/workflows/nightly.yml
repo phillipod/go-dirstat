@@ -85,6 +85,26 @@ jobs:
           grep -q '^By extension$' "$fixture/extensions.txt"
           grep -q '^Largest files$' "$fixture/extensions.txt"
 
+          "$DIRSTAT" status --format=json "$fixture" > "$fixture/status.jsonl"
+          grep -q '"total_bytes"' "$fixture/status.jsonl"
+
+          "$DIRSTAT" query --apparent --kind=file --format=tsv \
+            --fields=size,path --sort=size:desc "$fixture" > "$fixture/query.tsv"
+          awk -F '\t' 'NF != 2 || $1 !~ /^[0-9]+$/ { exit 1 } END { if (NR < 2) exit 1 }' "$fixture/query.tsv"
+
+          "$DIRSTAT" inspect --format=json --content --limit=16 "$fixture/alpha.txt" > "$fixture/inspect.json"
+          grep -q '"preview"' "$fixture/inspect.json"
+
+          "$DIRSTAT" history --store "$fixture/history" growth --format=json "$fixture" > "$fixture/history-baseline.json"
+          "$DIRSTAT" history --store "$fixture/history" growth --format=json "$fixture" > "$fixture/history-growth.json"
+          grep -q '"baseline":false' "$fixture/history-growth.json"
+
+          "$DIRSTAT" plan --root "$fixture" --output "$fixture/touch.plan.jsonl" touch generated.txt
+          "$DIRSTAT" apply --dry-run --no-audit "$fixture/touch.plan.jsonl" > "$fixture/dry-run.jsonl"
+          test ! -e "$fixture/generated.txt"
+          "$DIRSTAT" apply --yes --no-audit "$fixture/touch.plan.jsonl" > "$fixture/applied.jsonl"
+          test -f "$fixture/generated.txt"
+
           if [[ "${{ matrix.symlinks }}" == "true" ]]; then
             ln -s "$fixture" "$fixture/sub/root-loop"
             "$DIRSTAT" --follow --apparent --format=tsv --bytes --files "$fixture" > "$fixture/follow.tsv"

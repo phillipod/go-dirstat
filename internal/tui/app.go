@@ -20,6 +20,20 @@ type Options struct {
 	// UseCache enables the persistent scan cache (instant open + background
 	// refresh).
 	UseCache bool
+	// ReadOnly disables every action that can modify filesystem contents.
+	ReadOnly bool
+	// Editor is an exact executable argv. The selected path is appended as the
+	// final argument; no shell is involved.
+	Editor []string
+	// Pager is an exact executable argv. The selected path is appended.
+	Pager []string
+	// Shell is an exact executable argv. It runs in the selected directory and
+	// never receives an interpolated path argument.
+	Shell []string
+	// AuditPath overrides fsops' default audit destination. DisableAudit is the
+	// explicit opt-out for environments that do not permit audit persistence.
+	AuditPath    string
+	DisableAudit bool
 }
 
 // App is the configured, runnable TUI. Build one with New, then call Run.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/phillipod/go-dirstat/internal/format"
+	"github.com/phillipod/go-dirstat/internal/fsops"
 	"github.com/phillipod/go-dirstat/internal/scan"
 	"github.com/phillipod/go-dirstat/internal/scope"
 	"github.com/phillipod/go-dirstat/internal/tree"
@@ -619,6 +621,271 @@ func TestModelStreamsProgress(t *testing.T) {
 	}
 	if contains(m.headerView(), "scanning") {
 		t.Errorf("completed scan still shows scanning status: %s", m.headerView())
+	}
+}
+
+func TestF8StagesGuardedDeleteAndTypedApply(t *testing.T) {
+	path, node := mkTree(t)
+	auditPath := filepath.Join(t.TempDir(), "tui-audit.jsonl")
+	app := New(path, scope.New(), tree.SizeApparent, 0, Options{AuditPath: auditPath})
+	m := newModel(app)
+	m = asModel(t, m, scanDoneMsg{node: node})
+	for i := range m.rows {
+		if m.rows[i].node.Name == "big.bin" {
+			m.cursor = i
+			break
+		}
+	}
+	target := m.selectedAbsolutePath()
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF8})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("F8 returned no staging command")
+	}
+	m = asModel(t, m, cmd())
+	if m.management != managementReview || len(m.queue) != 1 {
+		t.Fatalf("management=%v queue=%#v", m.management, m.queue)
+	}
+	if m.queue[0].Action != "delete" || m.queue[0].Expected == nil || m.queue[0].Expected.Path != target {
+		t.Fatalf("unguarded queued operation: %#v", m.queue[0])
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("staging mutated target: %v", err)
+	}
+
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.management != managementConfirm {
+		t.Fatalf("management=%v, want confirm", m.management)
+	}
+	m = asModel(t, m, key("apply"))
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.management != managementConfirm || !contains(m.managementError, "APPLY exactly") {
+		t.Fatal("lowercase confirmation was accepted")
+	}
+	m.managementInput, m.managementError = "APPLY", ""
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*model)
+	if cmd == nil || m.management != managementApplying {
+		t.Fatal("confirmed apply did not start asynchronously")
+	}
+	m = asModel(t, m, cmd())
+	if m.management != managementResult || len(m.queue) != 0 {
+		t.Fatalf("post-apply state management=%v queue=%d error=%q", m.management, len(m.queue), m.managementError)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("target still exists: %v", err)
+	}
+	if info, err := os.Stat(auditPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("audit log missing or unsafe: info=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(path, ".dirstat-audit.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("TUI ignored configured audit path: %v", err)
+	}
+}
+
+func TestF8MarksDirectoryDeleteRecursive(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	for i := range m.rows {
+		if m.rows[i].node.Name == "sub" {
+			m.cursor = i
+			break
+		}
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF8})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("directory delete returned no staging command")
+	}
+	m = asModel(t, m, cmd())
+	if len(m.queue) != 1 || !m.queue[0].Recursive || m.queue[0].Expected == nil || m.queue[0].Expected.Kind != "directory" {
+		t.Fatalf("directory delete is not explicitly recursive: %#v", m.queue)
+	}
+}
+
+func TestPartialApplyDropsCompletedOperationsAndRescans(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{DisableAudit: true}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	m.queue = []fsops.Operation{
+		{ID: "done", Action: fsops.ActionDelete, Source: filepath.Join(path, "done")},
+		{ID: "failed", Action: fsops.ActionDelete, Source: filepath.Join(path, "failed")},
+		{ID: "pending", Action: fsops.ActionDelete, Source: filepath.Join(path, "pending")},
+	}
+	m.management = managementApplying
+	updated, cmd := m.Update(appliedMsg{
+		results: []fsops.Result{
+			{OperationID: "done", Action: fsops.ActionDelete, Status: "ok"},
+			{OperationID: "failed", Action: fsops.ActionDelete, Status: "error", Error: "stale"},
+		},
+		err: errors.New("stale"),
+	})
+	m = updated.(*model)
+	if cmd == nil || !m.scanning {
+		t.Fatal("partial mutation did not start a rescan")
+	}
+	if len(m.queue) != 2 || m.queue[0].ID != "failed" || m.queue[1].ID != "pending" {
+		t.Fatalf("remaining queue = %#v", m.queue)
+	}
+	if m.management != managementResult || !contains(m.managementError, "stale") {
+		t.Fatalf("management=%v error=%q", m.management, m.managementError)
+	}
+}
+
+func TestF5QueuesCopyDestinationWithoutMutation(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	for i := range m.rows {
+		if m.rows[i].node.Name == "a.go" {
+			m.cursor = i
+			break
+		}
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyF5})
+	if m.management != managementDestination {
+		t.Fatalf("management=%v", m.management)
+	}
+	m = asModel(t, m, key("copy.go"))
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("copy destination returned no staging command")
+	}
+	m = asModel(t, m, cmd())
+	if len(m.queue) != 1 || m.queue[0].Destination != filepath.Join(path, "copy.go") {
+		t.Fatalf("queue=%#v", m.queue)
+	}
+	if _, err := os.Stat(filepath.Join(path, "copy.go")); !os.IsNotExist(err) {
+		t.Fatalf("queueing copied file: %v", err)
+	}
+}
+
+func TestF6AndF7QueueMoveAndMkdir(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	for i := range m.rows {
+		if m.rows[i].node.Name == "a.go" {
+			m.cursor = i
+			break
+		}
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyF6})
+	m = asModel(t, m, key("moved.go"))
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("move returned no staging command")
+	}
+	m = asModel(t, m, cmd())
+	if len(m.queue) != 1 || m.queue[0].Action != "move" || m.queue[0].Destination != filepath.Join(path, "moved.go") {
+		t.Fatalf("move queue=%#v", m.queue)
+	}
+	m.closeManagement()
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyF7})
+	m = asModel(t, m, key("new-directory"))
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*model)
+	if cmd == nil {
+		t.Fatal("mkdir returned no staging command")
+	}
+	m = asModel(t, m, cmd())
+	if len(m.queue) != 2 || m.queue[1].Action != "mkdir" || m.queue[1].Source != filepath.Join(path, "new-directory") {
+		t.Fatalf("mkdir queue=%#v", m.queue)
+	}
+	if _, err := os.Stat(filepath.Join(path, "new-directory")); !os.IsNotExist(err) {
+		t.Fatalf("queueing created directory: %v", err)
+	}
+}
+
+func TestReadOnlyBlocksManagementAndEditor(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{ReadOnly: true, Editor: []string{"editor"}}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF8})
+	m = updated.(*model)
+	if cmd != nil || len(m.queue) != 0 || !contains(m.managementError, "read-only") {
+		t.Fatalf("delete not blocked: queue=%v error=%q", m.queue, m.managementError)
+	}
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyF4})
+	m = updated.(*model)
+	if cmd != nil || !contains(m.managementError, "read-only") {
+		t.Fatal("editor not blocked in read-only mode")
+	}
+	if !contains(m.headerView(), "read-only") {
+		t.Fatal("read-only mode is not visible")
+	}
+}
+
+func TestExternalEditorUsesExactArgvWithoutShell(t *testing.T) {
+	cmd, err := pathCommand([]string{"editor", "--flag", "value;touch /tmp/bad"}, "/tmp/a file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"editor", "--flag", "value;touch /tmp/bad", "/tmp/a file"}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("argv=%q, want %q", cmd.Args, want)
+	}
+}
+
+func TestExternalEditorRejectsSudo(t *testing.T) {
+	if _, err := pathCommand([]string{"/usr/bin/sudo", "editor"}, "/tmp/file"); err == nil || !contains(err.Error(), "sudo") {
+		t.Fatalf("sudo command was accepted: %v", err)
+	}
+}
+
+func TestPagerAndShellCommandsPreserveExactArgv(t *testing.T) {
+	pager, err := pathCommand([]string{"pager", "--literal=a;b"}, "/tmp/a file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"pager", "--literal=a;b", "/tmp/a file"}; !reflect.DeepEqual(pager.Args, want) {
+		t.Fatalf("pager argv=%q, want %q", pager.Args, want)
+	}
+	shell, err := workingDirectoryCommand([]string{"shell", "--noprofile"}, "/tmp/a directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"shell", "--noprofile"}; !reflect.DeepEqual(shell.Args, want) {
+		t.Fatalf("shell argv=%q, want %q", shell.Args, want)
+	}
+	if shell.Dir != "/tmp/a directory" {
+		t.Fatalf("shell cwd=%q", shell.Dir)
+	}
+	for _, argv := range [][]string{{"sudo", "pager"}, {"/usr/bin/sudo", "shell"}} {
+		if err := validateExecutable(argv); err == nil {
+			t.Fatalf("accepted sudo argv %q", argv)
+		}
+	}
+}
+
+func TestF3TogglesPreviewContextPanel(t *testing.T) {
+	m := newModel(New(t.TempDir(), scope.New(), tree.SizeApparent, 0, Options{}))
+	if !m.contextPanel {
+		t.Fatal("context panel should start enabled")
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyF3})
+	if m.contextPanel {
+		t.Fatal("F3 did not hide context panel")
+	}
+	m = asModel(t, m, tea.KeyMsg{Type: tea.KeyF3})
+	if !m.contextPanel {
+		t.Fatal("F3 did not show context panel")
+	}
+}
+
+func TestHelpBlocksFilesystemActionKeys(t *testing.T) {
+	path, node := mkTree(t)
+	m := newModel(New(path, scope.New(), tree.SizeApparent, 0, Options{}))
+	m = asModel(t, m, scanDoneMsg{node: node})
+	m = asModel(t, m, key("?"))
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF8})
+	m = updated.(*model)
+	if cmd != nil || m.management != managementNone || len(m.queue) != 0 {
+		t.Fatal("F8 escaped the help modal")
 	}
 }
 

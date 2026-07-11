@@ -8,7 +8,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/phillipod/go-dirstat/internal/format"
+	"github.com/phillipod/go-dirstat/internal/fsinfo"
+	"github.com/phillipod/go-dirstat/internal/fsops"
 	"github.com/phillipod/go-dirstat/internal/index"
+	"github.com/phillipod/go-dirstat/internal/preview"
 	"github.com/phillipod/go-dirstat/internal/scan"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
@@ -73,9 +76,29 @@ type model struct {
 	sort         tree.SortMode
 	extSort      extSortMode
 	sizeMode     tree.SizeMode
-	selectedPath string // stable tree selection across sorting/live snapshots
-	selectedExt  string // stable extension selection across sorting/mode changes
-	selectedFile string // stable largest-file selection across size-mode changes
+	selectedPath string          // stable tree selection across sorting/live snapshots
+	selectedExt  string          // stable extension selection across sorting/mode changes
+	selectedFile string          // stable largest-file selection across size-mode changes
+	marks        map[string]bool // absolute paths selected for a batch action
+	filter       string
+	filterInput  string
+	filtering    bool
+	contextPanel bool
+
+	management       managementMode
+	managementInput  string
+	managementError  string
+	managementAction fsops.Action
+	queue            []fsops.Operation
+	applyResults     []fsops.Result
+	applyCancel      context.CancelFunc
+	nextOperation    uint64
+
+	inspectGeneration uint64
+	inspectPath       string
+	inspectEntry      fsinfo.Entry
+	inspectPreview    *preview.Result
+	inspectErr        error
 
 	expanded map[string]bool // keyed by node.Path(); root is ""
 
@@ -110,18 +133,20 @@ func newModel(app *App) *model {
 		abs = app.path
 	}
 	m := &model{
-		app:         app,
-		ctx:         context.Background(),
-		scanning:    true,
-		view:        viewTree,
-		returnView:  viewTree,
-		sort:        tree.SortSizeDesc,
-		extSort:     extSortSize,
-		sizeMode:    app.sizeMode,
-		expanded:    map[string]bool{"": true}, // root expanded by default
-		root:        &tree.Node{Name: filepath.Base(abs), IsDir: true, Depth: 0},
-		rootAbs:     abs,
-		fingerprint: index.Fingerprint(abs, app.policy),
+		app:          app,
+		ctx:          context.Background(),
+		scanning:     true,
+		view:         viewTree,
+		returnView:   viewTree,
+		sort:         tree.SortSizeDesc,
+		extSort:      extSortSize,
+		sizeMode:     app.sizeMode,
+		expanded:     map[string]bool{"": true}, // root expanded by default
+		marks:        make(map[string]bool),
+		contextPanel: true,
+		root:         &tree.Node{Name: filepath.Base(abs), IsDir: true, Depth: 0},
+		rootAbs:      abs,
+		fingerprint:  index.Fingerprint(abs, app.policy),
 	}
 	if app.opts.UseCache {
 		if st, err := index.NewStore(); err == nil {
@@ -167,4 +192,67 @@ type scanDoneMsg struct {
 	node       *tree.Node
 	stats      scan.Stats
 	err        error
+}
+
+type inspectMsg struct {
+	generation uint64
+	path       string
+	entry      fsinfo.Entry
+	preview    *preview.Result
+	err        error
+}
+
+type stagedMsg struct {
+	operations []fsops.Operation
+	err        error
+}
+
+type appliedMsg struct {
+	results []fsops.Result
+	err     error
+}
+
+type externalDoneMsg struct {
+	kind string
+	err  error
+}
+
+func (m *model) selectedAbsolutePath() string {
+	var rel string
+	switch m.dataView() {
+	case viewLargest:
+		if m.cursor >= 0 && m.cursor < len(m.topRows) {
+			rel = m.topRows[m.cursor].file.Rel
+		}
+	case viewTree:
+		if r := m.currentRow(); r != nil {
+			rel = r.node.Path()
+		}
+	default:
+		return ""
+	}
+	if rel == "" || rel == "." {
+		return m.rootAbs
+	}
+	return filepath.Join(m.rootAbs, filepath.FromSlash(rel))
+}
+
+func (m *model) requestInspect() tea.Cmd {
+	path := m.selectedAbsolutePath()
+	if path == "" {
+		m.inspectPath, m.inspectPreview, m.inspectErr = "", nil, nil
+		return nil
+	}
+	m.inspectGeneration++
+	generation := m.inspectGeneration
+	return func() tea.Msg {
+		entry, err := fsinfo.Inspect(path, false)
+		msg := inspectMsg{generation: generation, path: path, entry: entry, err: err}
+		if err == nil && entry.Kind == "file" {
+			if got, readErr := preview.Read(path, preview.Options{Limit: 8 * 1024}); readErr == nil {
+				msg.preview = &got
+			}
+		}
+		return msg
+	}
 }

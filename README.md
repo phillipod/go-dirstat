@@ -3,19 +3,25 @@
 [![CI](https://github.com/phillipod/go-dirstat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/phillipod/go-dirstat/actions/workflows/ci.yml)
 [![Coverage](https://github.com/phillipod/go-dirstat/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/phillipod/go-dirstat/actions/workflows/coverage.yml)
 
-Read-only terminal disk-usage exploration for people and shell pipelines.
+Terminal disk-usage analysis and guarded space management for operators and
+shell pipelines.
 
-`dirstat` measures directory trees and reports size, file counts, and
-breakdowns through three output surfaces:
+`dirstat` measures directory trees, explains filesystem pressure, identifies
+growth and cleanup candidates, and can apply an explicit, auditable mutation
+plan. It exposes four complementary surfaces:
 
 - a **rich text listing** (the default) with proportional
   bars, percentages, and file/dir counts; plus a by-extension breakdown and a
   largest-files view;
-- stable, headerless **two-column TSV** for `cut`, `awk`, and `sort`; and
+- stable, headerless **two-column TSV** for `cut`, `awk`, and `sort`;
+- selectable-field **JSONL, TSV, and NUL-delimited query output** for scripts;
+  and
 - a **full-screen interactive TUI** (`dirstat tui`) — browse the tree, expand
   and collapse directories, inspect extension and largest-file views, cycle
   sort and size mode, and watch a persistent
-  cache refresh in the background. The tree **populates progressively**: top-level
+  metadata and bounded content previews, mark candidates, stage guarded file
+  operations, and watch a persistent cache refresh in the background. The tree
+  **populates progressively**: top-level
   directories appear instantly and their sizes climb live under an explicit
   `scanning…` status, with no blocking loading screen.
 
@@ -28,6 +34,13 @@ inode, `du` semantics):
 the lexicographically first included path claims the size and every other link
 shows as a zero-size `↪` entry, so totals and ownership stay stable across
 concurrent scans.
+
+Mutations are deliberately separate from measurement. `plan` creates a
+versioned JSONL operation file with the selected object's identity, size, and
+modification time; `apply` revalidates those facts, confines every path to the
+declared root, refuses conflicts by default, and appends a private audit record.
+It runs only with the caller's privileges and never invokes `sudo` or a helper
+daemon.
 
 ## Install
 
@@ -57,7 +70,8 @@ The repository uses GitHub-hosted public runners exclusively:
   with tests, vet, the race detector, and golangci-lint.
 - **Coverage** runs on pull requests, `main`, and a nightly schedule under the
   minimum supported Go line and the current stable Go release. Reports are
-  retained as workflow artifacts with an 80% statement-coverage floor.
+  retained as workflow artifacts with a 70% cross-package statement-coverage
+  floor.
 - **Nightly integration** runs shuffled tests and real CLI smoke tests across
   Linux, macOS, and Windows, including followed-symlink loop protection where
   the runner supports symlinks.
@@ -89,6 +103,21 @@ dirstat ext ~/projects
 
 # Full-screen interactive browser
 dirstat tui ~/projects
+
+# Capacity/inode pressure and bounded host diagnostics
+dirstat status /
+dirstat diagnose --format=json /
+
+# Rich candidate records for automation
+dirstat query --format=jsonl --kind=file --min-size=1G /srv
+
+# Inspect before changing anything
+dirstat inspect --content /srv/archive/old.log
+
+# Stage, review, dry-run, then explicitly apply a guarded deletion
+dirstat plan delete --root /srv /srv/archive/old.log > cleanup.jsonl
+dirstat apply --dry-run cleanup.jsonl
+dirstat apply --yes cleanup.jsonl
 
 # Build/version information (the `version` subcommand is equivalent)
 dirstat --version
@@ -192,6 +221,87 @@ TSV is currently a tree-output contract. The format flag is not offered by the
 `extensions` or `tui` commands, and combining it with `--by-ext` is rejected,
 so incompatible record shapes cannot be mixed silently.
 
+### Candidate queries for automation
+
+`dirstat query [path...]` flattens a completed measurement into candidate
+records. It accepts the normal scope and size-mode flags plus size, age, owner,
+group, extension, kind, glob, regexp, and multi-key sort filters. Metadata is
+loaded only for surviving candidates when `--metadata` or a metadata field is
+requested.
+
+- `--format=jsonl` emits one self-describing record per line.
+- `--format=tsv` emits only the comma-separated `--fields`; it has no header.
+- `--format=nul` emits absolute paths terminated by NUL for direct use with
+  `xargs -0` and similarly safe consumers.
+
+The default TSV fields are `path,kind,size,size-human,mtime`. `size` is always
+an exact byte integer using the selected on-disk/apparent mode; `size-human`
+uses compact `B/K/M/G/T/...` units. Path and metadata cells escape controls so
+one record always occupies one physical line.
+
+```bash
+# Exact numeric candidates, safe to feed to awk.
+dirstat query --kind=file --min-size=100M --format=tsv \
+  --fields=size,path /var | awk -F '\t' '$1 >= 1073741824 { print $2 }'
+
+# Structured review of old logs, largest first.
+dirstat query --kind=file --extension=log --older-than=720h \
+  --sort=size:desc --format=jsonl /srv
+
+# NUL-safe path transport. This still only prints; it does not delete.
+dirstat query --kind=file --path-regexp='\.tmp$' --format=nul /srv | xargs -0 -n1 printf '%s\n'
+```
+
+### Pressure, inspection, and growth
+
+- `status` reports byte and inode pressure for the volume containing each path.
+- `diagnose` adds bounded platform evidence. On Linux this includes unlinked
+  files still held open under `/proc`; unsupported probes are reported as
+  unavailable rather than as an empty success.
+- `inspect` reports no-follow metadata and optionally a bounded text or hex
+  head/tail preview.
+- `history growth` records a fresh scope-fingerprinted snapshot and compares it
+  with the previous retained scan. History keeps at most 20 snapshots for 30
+  days and classifies paths as new, grown, shrunk, or removed.
+
+Every one of these commands has JSON output for machine consumers; query uses
+JSONL because it is a record stream.
+
+### Guarded plans and apply
+
+`dirstat plan ACTION SOURCE [DESTINATION]` supports `delete`, `copy`, `move`,
+`rename`, `mkdir`, `touch`, `truncate`, `chmod`, `chown`, `archive`, and
+`extract`. It canonicalizes `--root`, rejects escaping paths and symlinked
+parents, validates action-specific flags, and captures existing source metadata
+without following the final symlink. Recursive directory deletion must be
+requested explicitly with `--recursive`; deleting or relocating the declared
+root is always refused.
+
+Plans and results are versioned JSONL so they can be reviewed, checked into an
+operations repository, or transported by existing administrative tooling.
+`apply` refuses to mutate without `--yes`; `--dry-run` performs the same
+confinement, stale-object, parameter, and conflict checks without changes.
+Destination conflicts fail unless `--conflict=overwrite` is explicit. Archive
+extraction rejects absolute and parent-traversal members.
+
+```bash
+dirstat plan delete --recursive --root /srv /srv/old-release -o cleanup.jsonl
+dirstat apply --dry-run cleanup.jsonl
+dirstat apply --yes cleanup.jsonl > cleanup-results.jsonl
+```
+
+Apply stops at the first failed operation and reports every completed result;
+it does not claim transactionality that filesystems cannot provide. Operations
+run with the current user's permissions only. Audit logging is on by default;
+use `--no-audit` only when an external control plane supplies equivalent
+records.
+
+The guards protect against stale selections, accidental path escape, and
+symlinked parents observed during validation. They are not a sandbox against a
+hostile process that can concurrently rename directories inside the managed
+root; for adversarial multi-user trees, first restrict write access or operate
+on a private snapshot/mount.
+
 ## TUI
 
 `dirstat tui [path]` opens a full-screen browser.
@@ -199,9 +309,16 @@ so incompatible record shapes cannot be mixed silently.
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` or `k`/`j` | move |
-| `space` / `l` / `→` | expand or collapse a directory |
+| `Enter` / `l` / `→` | expand or collapse a directory |
+| `Space` | mark or unmark a file/directory for a batch action |
 | `h` / `←` | collapse, or jump to parent |
 | `g` / `G` | top / bottom · `PgUp`/`PgDn` page |
+| `/` / `Ctrl+L` | filter visible paths / clear filter |
+| `i` / `p` / `F3` | toggle metadata and bounded content context |
+| `F4` / `o` / `!` | configured editor / pager / shell |
+| `F5` / `F6` | stage copy / move for the selection or marked paths |
+| `F7` / `F8` | stage mkdir / recursive delete |
+| `a` | review the operation queue, then type `APPLY` to execute |
 | `s` | cycle tree sort: size → count → mtime → name; extension sort: size → count → name |
 | `m` | toggle on-disk / apparent size |
 | `e` / `t` | extensions view / tree view |
@@ -211,14 +328,20 @@ so incompatible record shapes cannot be mixed silently.
 | `c` / `Esc` | stop an active scan and keep the current partial/cached results |
 | `?` | help · `q` / `Ctrl+C` quit |
 
-The first-release TUI targets the read-only analysis loop shared by WinDirStat,
-TreeSize, XTree, and commander-style file browsers: progressive measurement,
-fast keyboard navigation, proportional size cues, alternate analytical views,
-stable selection while data changes, and an inspectable detail line. It is not
-yet a feature-for-feature replacement. Search/type-to-jump, a true two-pane
-tree-and-files layout, terminal treemap, multi-snapshot comparison, and history
-are the main remaining product gaps. Destructive file operations are outside
-the current scope.
+The TUI combines the disk emphasis of WinDirStat/TreeSize with the keyboard
+workflow of Norton Commander and XTree. It keeps the measured tree primary and
+adds an adaptive metadata/content pane at widths of 120 columns or more; every
+operation remains available in compact terminals through the same keys and
+modal queue. Actions are staged from the selected/marked paths, guarded with
+captured no-follow metadata, reviewed as a list, and require the exact typed
+confirmation `APPLY`. A successful or partial apply triggers a fresh scan, so
+the displayed totals do not pretend that a failed batch was atomic.
+
+The TUI is still focused on disk-pressure work, not general file-manager
+parity: there is no remote transport, privilege escalation, plugin execution,
+or shell interpolation. Terminal treemaps and an interactive history-diff view
+remain future opportunities; growth comparison is currently available through
+`dirstat history growth`.
 
 **Cache.** The TUI keeps a snapshot under
 `<cache dir>/dirstat/` keyed by the scan root **and** a fingerprint of the
@@ -228,6 +351,29 @@ once it lands, the tree is swapped in and the cache is updated. Change a scope
 flag and the fingerprint changes, so a full rescan runs automatically. Use
 `--no-cache` to bypass it.
 
+**Configuration and audit.** Optional configuration lives at the platform user
+configuration path under `dirstat/config.json`. External tools are exact argv
+arrays; the selected path is appended to editor/pager argv, while a configured
+shell is started with its working directory set to the selected directory.
+Paths are never interpolated into a shell command, and direct `sudo` execution
+is rejected.
+
+```json
+{
+  "tools": {
+    "pager": ["less", "-R"],
+    "editor": ["vim", "--"],
+    "shell": ["bash", "-l"]
+  },
+  "read_only": false,
+  "audit_path": "/var/tmp/dirstat-operations.jsonl"
+}
+```
+
+Without an override, mutation results are appended to a mode-`0600` audit file
+in the platform state directory. `tui --read-only` disables mutations and the
+external editor/shell. `--no-audit` is available only as an explicit opt-out.
+
 ## Accuracy
 
 Both size models are measured during the scan:
@@ -236,11 +382,12 @@ Both size models are measured during the scan:
 - **on-disk** — allocated 512-byte blocks (the number plain `du` prints).
 
 Linux and macOS expose allocated blocks and stable device/inode identities to
-the scanner. On other targets, including Windows, the current portable fallback
-reports logical size for both display modes; filesystem-type filtering is not
-available there, and `-x` cannot distinguish device boundaries. Symlink-loop
-protection falls back to canonical paths; hardlink deduplication is also limited
-to Linux and macOS in this release.
+the scanner. Windows exposes stable volume/file identities through file
+handles, so boundary checks, followed-symlink loop protection, and hardlink
+deduplication work there too; Windows currently reports logical size for both
+display modes because its portable stat result does not expose allocated
+blocks. Filesystem-type include/exclude filtering remains a Linux/macOS
+capability and fails clearly elsewhere.
 
 Focused scanner tests cover both size models and hardlink deduplication.
 Per-entry errors (e.g. permission denied) are recorded on the node and do not
@@ -256,10 +403,17 @@ dependency drift is visible during maintenance.
 cmd/dirstat            entrypoint  — tiny main; hands off to cli
 internal/cli           wiring      — cobra commands, flags, the run pipeline
 internal/render        presentation — rich text and scriptable TSV output
-internal/tui           presentation — Bubble Tea interactive browser
+internal/tui           presentation — Bubble Tea browser and action queue
+internal/preview       presentation — bounded text/hex content previews
 internal/scan          domain      — concurrent scanner, builds the tree
 internal/agg           domain      — extension/top-file breakdowns
 internal/index         domain      — snapshot, scope fingerprint, and disk store
+internal/query         domain      — flat filtering, sorting, JSONL/TSV/NUL
+internal/history       domain      — retained snapshots and growth deltas
+internal/diagnose      domain      — volume and platform pressure evidence
+internal/fsops         domain      — guarded plans, mutations, and audit records
+internal/config        foundation  — optional user tools and safety defaults
+internal/fsinfo        foundation  — on-demand metadata and volume capacity
 internal/scope         foundation  — all filtering policy (cross-fs, fstype, …)
 internal/format        foundation  — bytes/bars/percent rendering helpers
 internal/tree          foundation  — the measured-Node data model (leaf)
@@ -279,6 +433,11 @@ Notable design points:
 - **Cache**: `index` fingerprints the scope so a cached snapshot is only reused
   when it was produced under the same options; the TUI loads it synchronously
   and refreshes asynchronously.
+- **Mutations**: `fsops` accepts versioned plans rather than raw UI gestures,
+  verifies stale identities and confinement immediately before each operation,
+  and records results as JSONL. The CLI and TUI are clients of the same engine.
+- **Metadata on demand**: `fsinfo` and `preview` inspect only selected/query
+  candidates, keeping the scanner's hot tree representation compact.
 
 ### Re-running the architecture review
 

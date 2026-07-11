@@ -15,15 +15,18 @@ func New() *cobra.Command {
 
 	root := &cobra.Command{
 		Use:   "dirstat [path...]",
-		Short: "Read-only terminal disk-usage explorer",
-		Long: `dirstat is a read-only terminal disk-usage explorer. It measures
-directory trees and reports sizes, file counts, and extension breakdowns. Use
-the rich text listing for human inspection, stable two-column TSV for shell
-pipelines, or the full-screen interactive TUI ("dirstat tui").
+		Short: "Analyze disk usage and apply guarded cleanup plans",
+		Long: `dirstat is a terminal disk-usage analyzer and guarded space manager.
+It measures directory trees, reports capacity and growth, finds scriptable
+cleanup candidates, and provides a full-screen interactive TUI. The default
+listing is rich text for people; TSV, JSONL, JSON, and NUL-delimited command
+surfaces support shell and operations automation.
 
 Scanning is concurrent (GOMAXPROCS workers) and, where device identity is
 available, stays on one filesystem by default. It skips /proc, /sys, /dev and
-/run unless explicitly requested otherwise.`,
+/run unless explicitly requested otherwise. Filesystem changes require a
+reviewable plan and explicit confirmation, are confined to the plan root,
+revalidate source metadata, and run only with the caller's privileges.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.Paths = args
@@ -38,6 +41,13 @@ available, stays on one filesystem by default. It skips /proc, /sys, /dev and
 
 	root.AddCommand(newTUICommand(cfg))
 	root.AddCommand(newExtensionsCommand(cfg))
+	root.AddCommand(newStatusCommand())
+	root.AddCommand(newInspectCommand())
+	root.AddCommand(newQueryCommand(cfg))
+	root.AddCommand(newDiagnoseCommand())
+	root.AddCommand(newHistoryCommand(cfg))
+	root.AddCommand(newPlanCommand())
+	root.AddCommand(newApplyCommand())
 	root.AddCommand(newVersionCmd())
 	return root
 }

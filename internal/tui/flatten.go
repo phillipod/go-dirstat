@@ -36,10 +36,31 @@ func (m *model) rebuild() {
 		return
 	}
 	m.rows = flatten(m.root, m.expanded, m.sort, m.sizeMode)
+	if m.filter != "" {
+		m.rows = filterTreeRows(m.rows, m.filter)
+	}
 	m.extRows = buildExtRows(m.root, m.sizeMode, m.extSort)
 	m.topRows = buildTopRows(m.root, m.sizeMode, largestFilesLimit)
 	m.restoreSelection()
 	m.clampOffset()
+}
+
+func filterTreeRows(rows []row, query string) []row {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return rows
+	}
+	out := make([]row, 0, len(rows))
+	for _, r := range rows {
+		path := r.node.Path()
+		if path == "" {
+			path = r.node.Name
+		}
+		if strings.Contains(strings.ToLower(path), query) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func buildTopRows(root *tree.Node, sm tree.SizeMode, limit int) []topRow {

@@ -1,4 +1,4 @@
-# dirstat — read-only terminal disk-usage exploration.
+# dirstat — terminal disk-usage analysis and guarded space management.
 BINARY   := dirstat
 PKG      := github.com/phillipod/go-dirstat
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)

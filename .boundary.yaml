@@ -13,9 +13,16 @@ class_inference:
   internal/cli: wiring
   internal/tui: presentation
   internal/render: presentation
+  internal/preview: presentation
+  internal/query: domain
+  internal/fsops: domain
+  internal/diagnose: domain
+  internal/history: domain
   internal/scan: domain
   internal/agg: domain
   internal/index: domain
+  internal/config: foundation
+  internal/fsinfo: foundation
   internal/scope: foundation
   internal/format: foundation
   internal/tree: foundation
@@ -27,9 +34,16 @@ ownership_inference:
   internal/cli: wiring
   internal/tui: ui
   internal/render: ui
+  internal/preview: ui
+  internal/query: engine
+  internal/fsops: engine
+  internal/diagnose: engine
+  internal/history: engine
   internal/scan: engine
   internal/agg: engine
   internal/index: engine
+  internal/config: infra
+  internal/fsinfo: infra
   internal/scope: infra
   internal/format: infra
   internal/tree: model

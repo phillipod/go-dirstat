@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -33,17 +34,24 @@ func (m *model) View() string {
 	b.WriteString(m.headerView())
 	b.WriteString("\n")
 	var body string
-	switch m.view {
-	case viewExt:
-		body = m.extBody()
-	case viewLargest:
-		body = m.topBody()
-	case viewHelp:
-		body = m.helpBody()
-	default:
-		body = m.treeBody()
+	if m.management != managementNone {
+		body = m.managementBody()
+	} else {
+		switch m.view {
+		case viewExt:
+			body = m.extBody()
+		case viewLargest:
+			body = m.topBody()
+		case viewHelp:
+			body = m.helpBody()
+		default:
+			body = m.treeBody()
+		}
 	}
 	body = strings.TrimRight(body, "\n")
+	if m.management == managementNone && m.showContextPanel() && m.view != viewHelp {
+		body = renderColumns(body, m.contextBody(), m.bodyWidth(), m.contextWidth())
+	}
 	if body != "" {
 		b.WriteString(body)
 		b.WriteString("\n")
@@ -85,22 +93,112 @@ func (m *model) headerView() string {
 	if m.stats.Errors > 0 {
 		badges = append(badges, errStyle.Render(fmt.Sprintf("%d err", m.stats.Errors)))
 	}
+	if len(m.marks) > 0 {
+		badges = append(badges, badgeStyle.Render(fmt.Sprintf("marked:%d", len(m.marks))))
+	}
+	if m.app.opts.ReadOnly {
+		badges = append(badges, dimStyle.Render("read-only"))
+	}
+	if len(m.queue) > 0 {
+		badges = append(badges, badgeStyle.Render(fmt.Sprintf("queued:%d", len(m.queue))))
+	}
+	if m.filter != "" {
+		badges = append(badges, dimStyle.Render("filter:"+format.SafeText(m.filter)))
+	}
 	return joinLine(m.width, title+"  "+stats, strings.Join(badges, " "))
 }
 
 func (m *model) footerView() string {
+	if m.management != managementNone {
+		line1 := m.managementError
+		if line1 == "" {
+			line1 = m.detailLine()
+		}
+		return truncate(line1, m.width) + "\n" + truncate(helpStyle.Render(m.managementHelp()), m.width)
+	}
+	if m.managementError != "" {
+		return truncate(errStyle.Render(m.managementError), m.width) + "\n" + truncate(helpStyle.Render("F3 preview · F4 edit · F5 copy · F6 move · F7 mkdir · F8 delete · a review"), m.width)
+	}
 	line1 := truncate(m.detailLine(), m.width)
 	keys := "? close help · q quit"
+	if m.filtering {
+		return truncate(m.detailLine(), m.width) + "\n" + truncate(helpStyle.Render("filter: "+m.filterInput+"█  Enter apply · Esc cancel"), m.width)
+	}
 	switch m.view {
 	case viewTree:
-		keys = "↑/↓ move · space expand · h/l collapse/open · e ext · f files · s sort · m mode · r rescan · c stop · ? help · q quit"
+		keys = "↑/↓ move · F3 preview · F4 edit · o pager · ! shell · F5 copy · F6 move · F7 mkdir · F8 delete · a review"
 	case viewExt:
-		keys = "↑/↓ move · t tree · f files · s sort · m mode · r rescan · c stop · ? help · q quit"
+		keys = "↑/↓ move · / search · t tree · f files · s sort · m mode · r rescan · ? help · q quit"
 	case viewLargest:
-		keys = "↑/↓ move · t tree · e ext · m mode · r rescan · c stop · ? help · q quit"
+		keys = "↑/↓ move · Space mark · / search · i inspect · F8 delete · t/e views · ? help"
 	}
 	line2 := helpStyle.Render(keys)
 	return line1 + "\n" + truncate(line2, m.width)
+}
+
+func (m *model) managementBody() string {
+	w := m.bodyWidth()
+	lines := []string{titleStyle.Render("Filesystem actions"), ""}
+	switch m.management {
+	case managementDestination:
+		lines = append(lines, fmt.Sprintf("%s %d selected path(s)", m.managementAction, len(m.actionPaths())), "", "Destination:", m.managementInput+"█")
+	case managementMkdir:
+		lines = append(lines, "Create directory", "", "Path (relative to scan root or absolute):", m.managementInput+"█")
+	case managementReview:
+		if len(m.queue) == 0 {
+			lines = append(lines, dimStyle.Render("Queue is empty."))
+			break
+		}
+		for i, op := range m.queue {
+			line := fmt.Sprintf("%2d  %-7s %s", i+1, op.Action, format.SafeText(op.Source))
+			if op.Destination != "" {
+				line += " → " + format.SafeText(op.Destination)
+			}
+			lines = append(lines, truncate(line, w))
+		}
+	case managementConfirm:
+		lines = append(lines, errStyle.Render(fmt.Sprintf("Apply %d guarded operation(s)?", len(m.queue))), "", "Type APPLY exactly:", m.managementInput+"█")
+	case managementApplying:
+		lines = append(lines, badgeStyle.Render(fmt.Sprintf("Applying %d operation(s)…", len(m.queue))), "", dimStyle.Render("Each source is revalidated against its captured identity, size, and modification time."))
+	case managementResult:
+		if m.managementError == "" {
+			lines = append(lines, badgeStyle.Render(fmt.Sprintf("Applied %d operation(s). Rescanning…", len(m.applyResults))))
+		} else {
+			lines = append(lines, errStyle.Render("Apply stopped: "+format.SafeText(m.managementError)))
+		}
+		for _, result := range m.applyResults {
+			line := fmt.Sprintf("%-7s %-7s %s", result.Status, result.Action, result.OperationID)
+			if result.Error != "" {
+				line += " · " + format.SafeText(result.Error)
+			}
+			lines = append(lines, truncate(line, w))
+		}
+	}
+	if m.managementError != "" && m.management != managementResult {
+		lines = append(lines, "", errStyle.Render(format.SafeText(m.managementError)))
+	}
+	if len(lines) > m.availHeight() {
+		lines = lines[:m.availHeight()]
+	}
+	for i := range lines {
+		lines[i] = truncate(lines[i], w)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) managementHelp() string {
+	switch m.management {
+	case managementDestination, managementMkdir, managementConfirm:
+		return "Enter continue · Esc cancel"
+	case managementReview:
+		return "Enter apply · d discard queue · Esc return"
+	case managementApplying:
+		return "Esc cancel between entries"
+	case managementResult:
+		return "Enter/Esc close"
+	default:
+		return "Esc close"
+	}
 }
 
 // detailLine shows rich info for the selected node (the "dirstat goodness").
@@ -150,7 +248,8 @@ func (m *model) nodeDetail(n *tree.Node) string {
 
 // treeBody renders the visible window of flattened tree rows.
 func (m *model) treeBody() string {
-	barW := barWidth(m.width)
+	w := m.bodyWidth()
+	barW := barWidth(w)
 	avail := m.availHeight()
 	var b strings.Builder
 	end := m.offset + avail
@@ -167,6 +266,7 @@ func (m *model) treeBody() string {
 }
 
 func (m *model) renderTreeRow(r row, selected bool, barW int) string {
+	w := m.bodyWidth()
 	n := r.node
 	indent := strings.Repeat("  ", r.depth)
 	glyph := " "
@@ -195,14 +295,19 @@ func (m *model) renderTreeRow(r row, selected bool, barW int) string {
 		name = name + " " + dimStyle.Render("↪") // inode counted under another name
 	}
 
-	left := indent + glyph + " "
+	mark := " "
+	abs := m.absoluteNodePath(n)
+	if m.marks[abs] {
+		mark = "●"
+	}
+	left := mark + indent + glyph + " "
 	mid := size + " " + barColorVal(format.Pct(n.Size(m.sizeMode), m.root.Size(m.sizeMode)), bar) + " " + pct + "  "
 	// budget for the name column so long names do not wrap.
-	budget := m.width - lipgloss.Width(left) - lipgloss.Width(size) - barW - lipgloss.Width(pct) - 4
+	budget := w - lipgloss.Width(left) - lipgloss.Width(size) - barW - lipgloss.Width(pct) - 4
 	if budget > 4 {
 		name = truncate(name, budget)
 	}
-	line := truncate(left+mid+name, m.width)
+	line := truncate(left+mid+name, w)
 	if selected {
 		line = cursorBg.Render(line)
 	}
@@ -216,7 +321,8 @@ func barColorVal(pct float64, bar string) string {
 
 // extBody renders the by-extension list.
 func (m *model) extBody() string {
-	barW := barWidth(m.width)
+	w := m.bodyWidth()
+	barW := barWidth(w)
 	avail := m.availHeight()
 	var b strings.Builder
 	end := m.offset + avail
@@ -228,7 +334,7 @@ func (m *model) extBody() string {
 		size := fmt.Sprintf("%6s", format.Bytes(r.ext.Size(m.sizeMode)))
 		pct := fmt.Sprintf("%5.1f%%", r.pct)
 		bar := barColorVal(r.pct, format.Bar(r.frac, barW))
-		line := truncate(size+" "+bar+" "+pct+"  "+dimStyle.Render(fmt.Sprintf("%6s", format.Count(r.ext.Count)))+"  "+extStyle.Render(format.SafeText(r.ext.Ext)), m.width)
+		line := truncate(size+" "+bar+" "+pct+"  "+dimStyle.Render(fmt.Sprintf("%6s", format.Count(r.ext.Count)))+"  "+extStyle.Render(format.SafeText(r.ext.Ext)), w)
 		if i == m.cursor {
 			line = cursorBg.Render(line)
 		}
@@ -243,7 +349,8 @@ func (m *model) extBody() string {
 // topBody renders the largest files, scaled against the whole scan so bars are
 // directly comparable with directory rows rather than only with one another.
 func (m *model) topBody() string {
-	barW := barWidth(m.width)
+	w := m.bodyWidth()
+	barW := barWidth(w)
 	avail := m.availHeight()
 	var b strings.Builder
 	end := min(m.offset+avail, len(m.topRows))
@@ -256,7 +363,12 @@ func (m *model) topBody() string {
 		if path == "" {
 			path = "."
 		}
-		line := truncate(size+" "+bar+" "+pct+"  "+format.SafeText(path), m.width)
+		mark := " "
+		abs := m.absoluteRelPath(path)
+		if m.marks[abs] {
+			mark = "●"
+		}
+		line := truncate(mark+size+" "+bar+" "+pct+"  "+format.SafeText(path), w)
 		if i == m.cursor {
 			line = cursorBg.Render(line)
 		}
@@ -271,7 +383,15 @@ func (m *model) topBody() string {
 func (m *model) helpBody() string {
 	rows := []struct{ key, desc string }{
 		{"↑/↓ or k/j", "move selection"},
-		{"space / l", "expand or collapse directory"},
+		{"Enter / l", "expand or collapse directory"},
+		{"Space", "mark or unmark selected path"},
+		{"/ / Ctrl+L", "search paths / clear filter"},
+		{"i / p", "toggle metadata/content context pane"},
+		{"F3 / F4", "preview pane / configured external editor"},
+		{"o / !", "configured pager / shell in selected directory"},
+		{"F5 / F6", "queue guarded copy / move"},
+		{"F7 / F8", "queue mkdir / staged delete"},
+		{"a", "review queue and apply with typed confirmation"},
 		{"h / ←", "collapse, or jump to parent"},
 		{"g / G", "jump to top / bottom"},
 		{"PgUp/PgDn", "scroll by a page"},
@@ -295,6 +415,96 @@ func (m *model) helpBody() string {
 	}
 	if avail := m.availHeight(); len(lines) > avail {
 		lines = lines[:avail]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) showContextPanel() bool { return m.contextPanel && m.width >= 120 }
+
+func (m *model) contextWidth() int {
+	if !m.showContextPanel() {
+		return 0
+	}
+	return max(36, m.width/3)
+}
+
+func (m *model) bodyWidth() int {
+	if m.management != managementNone {
+		return m.width
+	}
+	if !m.showContextPanel() {
+		return m.width
+	}
+	return m.width - m.contextWidth() - 1
+}
+
+func (m *model) absoluteRelPath(rel string) string {
+	if rel == "" || rel == "." {
+		return m.rootAbs
+	}
+	return filepath.Join(m.rootAbs, filepath.FromSlash(rel))
+}
+
+func (m *model) absoluteNodePath(n *tree.Node) string {
+	if n == nil {
+		return ""
+	}
+	return m.absoluteRelPath(n.Path())
+}
+
+func (m *model) contextBody() string {
+	w := m.contextWidth()
+	if m.view == viewExt {
+		return truncate(titleStyle.Render("Extension analysis"), w) + "\n\n" + truncate(m.detailLine(), w)
+	}
+	if m.inspectPath == "" {
+		return truncate(titleStyle.Render("Inspect"), w) + "\n\n" + dimStyle.Render("Move selection to load metadata")
+	}
+	var lines []string
+	lines = append(lines, truncate(titleStyle.Render("Inspect"), w), truncate(format.SafeText(m.inspectPath), w), "")
+	if m.inspectErr != nil {
+		lines = append(lines, truncate(errStyle.Render(format.SafeText(m.inspectErr.Error())), w))
+		return strings.Join(lines, "\n")
+	}
+	e := m.inspectEntry
+	lines = append(lines,
+		truncate(fmt.Sprintf("%s  %s", e.Kind, e.ModeText), w),
+		truncate(fmt.Sprintf("size %s · allocated %s", format.Bytes(e.Size), format.Bytes(e.Allocated)), w),
+		truncate(fmt.Sprintf("owner %s:%s · links %d", e.Owner, e.Group, e.Links), w),
+		truncate("modified "+e.ModTime.Format("2006-01-02 15:04:05"), w),
+	)
+	if e.Symlink != "" {
+		lines = append(lines, truncate("→ "+format.SafeText(e.Symlink), w))
+	}
+	if m.inspectPreview != nil {
+		lines = append(lines, "", dimStyle.Render("preview"))
+		body := m.inspectPreview.Text
+		if m.inspectPreview.Binary {
+			body = m.inspectPreview.Hex
+		}
+		for _, line := range strings.Split(body, "\n") {
+			if len(lines) >= m.availHeight() {
+				break
+			}
+			lines = append(lines, truncate(format.SafeText(line), w))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderColumns(left, right string, leftWidth, rightWidth int) string {
+	ll, rr := strings.Split(left, "\n"), strings.Split(right, "\n")
+	n := max(len(ll), len(rr))
+	lines := make([]string, n)
+	for i := 0; i < n; i++ {
+		l, r := "", ""
+		if i < len(ll) {
+			l = truncate(ll[i], leftWidth)
+		}
+		if i < len(rr) {
+			r = truncate(rr[i], rightWidth)
+		}
+		lines[i] = l + strings.Repeat(" ", max(0, leftWidth-lipgloss.Width(l))) + "│" + r
 	}
 	return strings.Join(lines, "\n")
 }

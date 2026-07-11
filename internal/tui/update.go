@@ -2,10 +2,12 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/phillipod/go-dirstat/internal/fsops"
 	"github.com/phillipod/go-dirstat/internal/index"
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
@@ -36,6 +38,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanNote = ""
 		m.scanErr = nil
 		m.rebuild()
+		if m.inspectGeneration == 0 {
+			return m, m.requestInspect()
+		}
 		return m, nil
 
 	case scanDoneMsg:
@@ -59,10 +64,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scanErr = nil
 		m.rebuild()
 		m.cacheSaves.markSuccessful(msg.generation)
+		inspect := m.requestInspect()
 		if m.store != nil {
-			return m, saveCmd(&m.cacheSaves, m.store, m.rootAbs, m.fingerprint, msg)
+			return m, tea.Batch(saveCmd(&m.cacheSaves, m.store, m.rootAbs, m.fingerprint, msg), inspect)
 		}
-		return m, nil
+		return m, inspect
 
 	case cacheSavedMsg:
 		if msg.generation != m.scanGeneration {
@@ -74,6 +80,65 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cacheErr = nil
 		}
 		return m, nil
+
+	case inspectMsg:
+		if msg.generation != m.inspectGeneration {
+			return m, nil
+		}
+		m.inspectPath, m.inspectEntry, m.inspectPreview, m.inspectErr = msg.path, msg.entry, msg.preview, msg.err
+		return m, nil
+
+	case stagedMsg:
+		if msg.err != nil {
+			m.managementError = msg.err.Error()
+			return m, nil
+		}
+		m.queue = append(m.queue, msg.operations...)
+		m.management, m.managementInput, m.managementError = managementReview, "", ""
+		return m, nil
+
+	case appliedMsg:
+		if m.applyCancel != nil {
+			m.applyCancel()
+			m.applyCancel = nil
+		}
+		m.applyResults = msg.results
+		if msg.err != nil {
+			completed := make(map[string]bool)
+			for _, result := range msg.results {
+				if result.Status == "ok" && !result.DryRun {
+					completed[result.OperationID] = true
+				}
+			}
+			if len(completed) > 0 {
+				remaining := m.queue[:0]
+				for _, op := range m.queue {
+					if !completed[op.ID] {
+						remaining = append(remaining, op)
+					}
+				}
+				m.queue, m.marks = remaining, make(map[string]bool)
+			}
+			m.management, m.managementError = managementResult, msg.err.Error()
+			if len(completed) > 0 {
+				return m, m.startScan()
+			}
+			return m, nil
+		}
+		m.queue, m.marks = nil, make(map[string]bool)
+		m.management, m.managementError = managementResult, ""
+		return m, m.startScan()
+
+	case externalDoneMsg:
+		if msg.err != nil {
+			m.managementError = msg.kind + " failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.managementError = ""
+		if msg.kind == "pager" {
+			return m, nil
+		}
+		return m, m.startScan()
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -88,6 +153,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey routes keystrokes to the active view's controller.
 func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.management != managementNone {
+		return m.handleManagementKey(k)
+	}
+	if m.filtering {
+		switch k.String() {
+		case "ctrl+c":
+			m.cancelScan()
+			return m, tea.Quit
+		case "esc":
+			m.filtering = false
+			m.filterInput = m.filter
+			return m, nil
+		case "enter":
+			m.filter = m.filterInput
+			m.filtering = false
+			m.rebuild()
+			return m, m.requestInspect()
+		case "backspace":
+			if len(m.filterInput) > 0 {
+				r := []rune(m.filterInput)
+				m.filterInput = string(r[:len(r)-1])
+			}
+			return m, nil
+		default:
+			if k.Type == tea.KeyRunes {
+				m.filterInput += string(k.Runes)
+			}
+			return m, nil
+		}
+	}
 	// Global keys work everywhere.
 	switch k.String() {
 	case "ctrl+c", "q":
@@ -112,6 +207,26 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.view = viewHelp
 		}
 		return m, nil
+	case "/":
+		m.filtering = true
+		m.filterInput = m.filter
+		return m, nil
+	case "ctrl+l":
+		m.filter, m.filterInput = "", ""
+		m.rebuild()
+		return m, m.requestInspect()
+	case "i", "p":
+		m.contextPanel = !m.contextPanel
+		if m.contextPanel {
+			return m, m.requestInspect()
+		}
+		return m, nil
+	case "f3":
+		m.contextPanel = !m.contextPanel
+		if m.contextPanel {
+			return m, m.requestInspect()
+		}
+		return m, nil
 	case "tab":
 		if m.view == viewHelp {
 			return m, nil
@@ -128,6 +243,28 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Help is modal: navigation and mode keys must not change the hidden view.
 	if m.view == viewHelp {
 		return m, nil
+	}
+	switch k.String() {
+	case "f4":
+		return m, m.externalEditorCmd()
+	case "f5":
+		m.startInput(fsops.ActionCopy)
+		return m, nil
+	case "f6":
+		m.startInput(fsops.ActionMove)
+		return m, nil
+	case "f7":
+		m.startInput(fsops.ActionMkdir)
+		return m, nil
+	case "f8":
+		return m, m.stageDelete()
+	case "a":
+		m.management, m.managementError = managementReview, ""
+		return m, nil
+	case "o":
+		return m, m.pagerCmd()
+	case "!":
+		return m, m.shellCmd()
 	}
 
 	// Size mode applies to both data views. Sorting is view-specific because
@@ -167,6 +304,15 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// force rescan; the placeholder tree refreshes as snapshots stream in
 		return m, m.startScan()
 	}
+	if k.String() == " " && (m.view == viewTree || m.view == viewLargest) {
+		if path := m.selectedAbsolutePath(); path != "" {
+			m.marks[path] = !m.marks[path]
+			if !m.marks[path] {
+				delete(m.marks, path)
+			}
+		}
+		return m, nil
+	}
 
 	switch m.view {
 	case viewExt, viewLargest:
@@ -174,6 +320,87 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m.treeKeys(k)
 	}
+}
+
+func (m *model) handleManagementKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if k.String() == "ctrl+c" {
+		if m.management == managementApplying {
+			if m.applyCancel != nil {
+				m.applyCancel()
+				m.managementError = "canceling…"
+			}
+			return m, nil
+		}
+		m.closeManagement()
+		m.cancelScan()
+		return m, tea.Quit
+	}
+	if m.management == managementApplying {
+		if k.String() == "esc" && m.applyCancel != nil {
+			m.applyCancel()
+			m.managementError = "canceling…"
+		}
+		return m, nil
+	}
+	switch k.String() {
+	case "esc":
+		m.closeManagement()
+		return m, nil
+	case "backspace":
+		if m.management == managementDestination || m.management == managementMkdir || m.management == managementConfirm {
+			r := []rune(m.managementInput)
+			if len(r) > 0 {
+				m.managementInput = string(r[:len(r)-1])
+			}
+		}
+		return m, nil
+	case "d":
+		if m.management == managementReview {
+			m.queue = nil
+			m.closeManagement()
+		}
+		return m, nil
+	case "enter":
+		switch m.management {
+		case managementDestination:
+			if strings.TrimSpace(m.managementInput) == "" {
+				m.managementError = "destination is required"
+				return m, nil
+			}
+			return m, m.stageCmd(m.managementAction, m.actionPaths(), m.managementInput)
+		case managementMkdir:
+			if strings.TrimSpace(m.managementInput) == "" {
+				m.managementError = "directory path is required"
+				return m, nil
+			}
+			return m, m.stageCmd(fsops.ActionMkdir, nil, m.managementInput)
+		case managementReview:
+			if len(m.queue) == 0 {
+				m.managementError = "queue is empty"
+				return m, nil
+			}
+			if m.app.opts.ReadOnly {
+				m.managementError = "read-only mode: apply is disabled"
+				return m, nil
+			}
+			m.management, m.managementInput, m.managementError = managementConfirm, "", ""
+			return m, nil
+		case managementConfirm:
+			if m.managementInput != "APPLY" {
+				m.managementError = "type APPLY exactly to continue"
+				return m, nil
+			}
+			m.management, m.managementError = managementApplying, ""
+			return m, m.applyCmd()
+		case managementResult:
+			m.closeManagement()
+			return m, nil
+		}
+	}
+	if k.Type == tea.KeyRunes && (m.management == managementDestination || m.management == managementMkdir || m.management == managementConfirm) {
+		m.managementInput += string(k.Runes)
+	}
+	return m, nil
 }
 
 // cycleView rotates tree -> extensions -> largest files -> tree (help is
@@ -231,14 +458,14 @@ func (m *model) treeKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = min(m.cursor+m.page(), n-1)
 	case "pgup", "ctrl+u":
 		m.cursor = max(m.cursor-m.page(), 0)
-	case " ", "l", "right", "enter":
+	case "l", "right", "enter":
 		m.toggleExpand()
 	case "h", "left", "H":
 		m.collapseOrUp()
 	}
 	m.rememberSelection()
 	m.clampOffset()
-	return m, nil
+	return m, m.requestInspect()
 }
 
 // moveOnly handles the non-tree data views, which are scrollable lists.
@@ -264,7 +491,7 @@ func (m *model) moveOnly(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	m.rememberSelection()
 	m.clampOffset()
-	return m, nil
+	return m, m.requestInspect()
 }
 
 func (m *model) visibleListLen() int {
