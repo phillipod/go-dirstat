@@ -39,6 +39,8 @@ func (m *model) View() string {
 		body = m.managementBody()
 	} else {
 		switch m.view {
+		case viewTree:
+			body = m.treeBody()
 		case viewExt:
 			body = m.extBody()
 		case viewLargest:
@@ -46,7 +48,7 @@ func (m *model) View() string {
 		case viewHelp:
 			body = m.helpBody()
 		default:
-			body = m.treeBody()
+			body = ""
 		}
 	}
 	body = strings.TrimRight(body, "\n")
@@ -75,6 +77,7 @@ func (m *model) headerView() string {
 		badges = append(badges, dimStyle.Render("sort:"+m.extSort.String()), dimStyle.Render(modeLabel(m.sizeMode)))
 	case viewLargest:
 		badges = append(badges, dimStyle.Render("top:100"), dimStyle.Render(modeLabel(m.sizeMode)))
+	case viewHelp:
 	}
 	if m.scanning {
 		badges = append(badges, badgeStyle.Render("scanning…"))
@@ -132,6 +135,7 @@ func (m *model) footerView() string {
 		keys = "↑/↓ move · / search · t tree · f files · s sort · m mode · r rescan · ? help · q quit"
 	case viewLargest:
 		keys = "↑/↓ move · Space mark · / search · i inspect · F8 delete · t/e views · ? help"
+	case viewHelp:
 	}
 	line2 := helpStyle.Render(keys)
 	return line1 + "\n" + truncate(line2, m.width)
@@ -141,6 +145,8 @@ func (m *model) managementBody() string {
 	w := m.bodyWidth()
 	lines := []string{titleStyle.Render("Filesystem actions"), ""}
 	switch m.management {
+	case managementNone:
+		return "Esc close"
 	case managementDestination:
 		lines = append(lines, fmt.Sprintf("%s %d selected path(s)", m.managementAction, len(m.actionPaths())), "", "Destination:", m.managementInput+"█")
 	case managementMkdir:
@@ -210,6 +216,8 @@ func successfulApplyCount(results []fsops.Result) int {
 
 func (m *model) managementHelp() string {
 	switch m.management {
+	case managementNone:
+		return ""
 	case managementDestination, managementMkdir, managementConfirm:
 		return "Enter continue · Esc cancel"
 	case managementReview:
@@ -219,7 +227,7 @@ func (m *model) managementHelp() string {
 	case managementResult:
 		return "Enter/Esc close"
 	default:
-		return "Esc close"
+		return ""
 	}
 }
 
@@ -535,6 +543,8 @@ func renderColumns(left, right string, leftWidth, rightWidth int) string {
 
 func viewName(v viewMode) string {
 	switch v {
+	case viewTree:
+		return "tree"
 	case viewExt:
 		return "extensions"
 	case viewLargest:
@@ -542,7 +552,7 @@ func viewName(v viewMode) string {
 	case viewHelp:
 		return "help"
 	default:
-		return "tree"
+		return "unknown"
 	}
 }
 

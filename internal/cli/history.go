@@ -38,7 +38,7 @@ func newHistoryListCommand(cfg *Config, storeDir *string) *cobra.Command {
 		Short: "List retained snapshots for a path and scan policy",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if output != "text" && output != "json" {
+			if output != outputFormatText && output != outputFormatJSON {
 				return fmt.Errorf("invalid --format %q: expected text or json", output)
 			}
 			root, policy, fingerprint, err := historyKey(cfg, firstPath(args))
@@ -54,7 +54,7 @@ func newHistoryListCommand(cfg *Config, storeDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if output == "json" {
+			if output == outputFormatJSON {
 				if records == nil {
 					records = []history.Record{}
 				}
@@ -87,7 +87,7 @@ func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 		Short: "Record a fresh scan and compare it with the previous snapshot",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if output != "text" && output != "json" {
+			if output != outputFormatText && output != outputFormatJSON {
 				return fmt.Errorf("invalid --format %q: expected text or json", output)
 			}
 			root, policy, fingerprint, err := historyKey(cfg, firstPath(args))
@@ -120,7 +120,7 @@ func newHistoryGrowthCommand(cfg *Config, storeDir *string) *cobra.Command {
 					return err
 				}
 			}
-			if output == "json" {
+			if output == outputFormatJSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(struct {
 					Baseline bool            `json:"baseline"`
 					Current  history.Record  `json:"current"`

@@ -160,8 +160,10 @@ func profileMetadata(profile Profile) (string, string) {
 		return "dirstat-operator", "Investigate disk pressure and prepare guarded dirstat cleanup plans with dry-run validation."
 	case ProfileAdministrator:
 		return "dirstat-administrator", "Operate dirstat under the administrator policy embedded in this skill."
-	default:
+	case ProfileReadOnly:
 		return "dirstat", "Analyze disk usage and propose safe cleanup with dirstat."
+	default:
+		return "", ""
 	}
 }
 
@@ -230,19 +232,25 @@ Use **dirstat** to establish disk pressure, locate specific candidates, and make
 The policy below was supplied when this skill was installed. It is the complete authority boundary for filesystem actions. You may execute an action only when a rule explicitly permits it; otherwise propose the action and request authorization. Continue to use guarded plans, dry-runs when the policy requires them, and audit logging.
 
 ` + rules)
-	default:
+	case ProfileReadOnly:
 		return []byte(common + `
 ## Safety boundary
 
 - Propose cleanup actions first. Do not delete, move, truncate, overwrite, or run **dirstat apply --yes** without the user's explicit authorization.
 - Keep audit logging and filesystem/symlink boundaries enabled unless the user explicitly directs otherwise.
 `)
+	default:
+		return nil
 	}
 }
 
 func normalizedRules(profile Profile, rules string) (string, error) {
-	if profile != ProfileAdministrator {
+	switch profile {
+	case ProfileReadOnly, ProfileOperator:
 		return "", nil
+	case ProfileAdministrator:
+	default:
+		return "", fmt.Errorf("unknown skill profile %q", profile)
 	}
 	if !utf8.ValidString(rules) {
 		return "", errors.New("administrator rules must be valid UTF-8 text")
@@ -439,8 +447,10 @@ func skillName(profile Profile) string {
 		return "dirstat-operator"
 	case ProfileAdministrator:
 		return "dirstat-administrator"
-	default:
+	case ProfileReadOnly:
 		return "dirstat"
+	default:
+		return ""
 	}
 }
 

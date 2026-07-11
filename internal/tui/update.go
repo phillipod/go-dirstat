@@ -12,6 +12,12 @@ import (
 	"github.com/phillipod/go-dirstat/internal/tree"
 )
 
+const (
+	keyCtrlC  = "ctrl+c"
+	keyEscape = "esc"
+	keyEnter  = "enter"
+)
+
 // Update handles all input and async messages.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -154,14 +160,14 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.filtering {
 		switch k.String() {
-		case "ctrl+c":
+		case keyCtrlC:
 			m.cancelScan()
 			return m, tea.Quit
-		case "esc":
+		case keyEscape:
 			m.filtering = false
 			m.filterInput = m.filter
 			return m, nil
-		case "enter":
+		case keyEnter:
 			m.filter = m.filterInput
 			m.filtering = false
 			m.rebuild()
@@ -181,13 +187,13 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	// Global keys work everywhere.
 	switch k.String() {
-	case "ctrl+c", "q":
+	case keyCtrlC, "q":
 		m.cancelScan()
 		return m, tea.Quit
 	case "c":
 		m.stopScan()
 		return m, nil
-	case "esc":
+	case keyEscape:
 		if m.view == viewHelp {
 			m.switchView(m.returnView)
 		} else {
@@ -282,7 +288,7 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.extSort = nextExtSort(m.extSort)
 		case viewTree:
 			m.sort = nextSort(m.sort)
-		default:
+		case viewLargest, viewHelp:
 			return m, nil
 		}
 		m.rebuild()
@@ -313,13 +319,16 @@ func (m *model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.view {
 	case viewExt, viewLargest:
 		return m.moveOnly(k)
-	default:
+	case viewTree:
 		return m.treeKeys(k)
+	case viewHelp:
+		return m, nil
 	}
+	return m, nil
 }
 
 func (m *model) handleManagementKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if k.String() == "ctrl+c" {
+	if k.String() == keyCtrlC {
 		if m.management == managementApplying {
 			if m.applyCancel != nil {
 				m.applyCancel()
@@ -332,14 +341,14 @@ func (m *model) handleManagementKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	if m.management == managementApplying {
-		if k.String() == "esc" && m.applyCancel != nil {
+		if k.String() == keyEscape && m.applyCancel != nil {
 			m.applyCancel()
 			m.managementError = "canceling…"
 		}
 		return m, nil
 	}
 	switch k.String() {
-	case "esc":
+	case keyEscape:
 		m.closeManagement()
 		return m, nil
 	case "backspace":
@@ -356,7 +365,7 @@ func (m *model) handleManagementKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.closeManagement()
 		}
 		return m, nil
-	case "enter":
+	case keyEnter:
 		switch m.management {
 		case managementDestination:
 			if strings.TrimSpace(m.managementInput) == "" {
@@ -392,6 +401,8 @@ func (m *model) handleManagementKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case managementResult:
 			m.closeManagement()
 			return m, nil
+		case managementNone, managementApplying:
+			return m, nil
 		}
 	}
 	if k.Type == tea.KeyRunes && (m.management == managementDestination || m.management == managementMkdir || m.management == managementConfirm) {
@@ -408,7 +419,7 @@ func (m *model) cycleView() {
 		m.switchView(viewExt)
 	case viewExt:
 		m.switchView(viewLargest)
-	default:
+	case viewLargest, viewHelp:
 		m.switchView(viewTree)
 	}
 }
@@ -419,7 +430,7 @@ func (m *model) cycleViewBackward() {
 		m.switchView(viewLargest)
 	case viewLargest:
 		m.switchView(viewExt)
-	default:
+	case viewExt, viewHelp:
 		m.switchView(viewTree)
 	}
 }
@@ -455,7 +466,7 @@ func (m *model) treeKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = min(m.cursor+m.page(), n-1)
 	case "pgup", "ctrl+u":
 		m.cursor = max(m.cursor-m.page(), 0)
-	case "l", "right", "enter":
+	case "l", "right", keyEnter:
 		m.toggleExpand()
 	case "h", "left", "H":
 		m.collapseOrUp()

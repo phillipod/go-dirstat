@@ -1,0 +1,78 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: false
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+      custom-order: true
+      no-inline-comments: true
+      no-prefix-comments: true
+
+linters:
+  enable:
+    - errcheck
+    - ineffassign
+    - staticcheck
+    - unused
+    - unparam
+    - goconst
+    - nolintlint
+    - dupl
+    - gocritic
+    - revive
+    - exhaustive
+  settings:
+    staticcheck:
+      checks: ["all"]
+    dupl:
+      threshold: 150
+    revive:
+      rules:
+        - name: receiver-naming
+        - name: var-naming
+        - name: confusing-naming
+        - name: unexported-naming
+        - name: unused-receiver
+    gocritic:
+      disable-all: true
+      enabled-checks:
+        - dupArg
+        - ifElseChain
+        - regexpMust
+        - singleCaseSwitch
+        - sloppyLen
+        - sloppyTypeAssert
+        - typeSwitchVar
+        - underef
+        - unslice
+    nolintlint:
+      require-explanation: true
+    exhaustive:
+      check:
+        - switch
+      default-signifies-exhaustive: false
+      package-scope-only: true
+      explicit-exhaustive-switch: false
+      default-case-required: false
+  exclusions:
+    generated: strict
+    rules:
+      - path: ".*_pb\\.go"
+        linters: ["*"]
+      - path: ".*_grpc\\.pb\\.go"
+        linters: ["*"]
+      - path: "^internal/testmock/"
+        linters: ["*"]

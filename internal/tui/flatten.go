@@ -101,6 +101,8 @@ func flatten(root *tree.Node, expanded map[string]bool, mode tree.SortMode, sm t
 
 func treeNodeLess(a, b *tree.Node, mode tree.SortMode, sm tree.SizeMode) bool {
 	switch mode {
+	case tree.SortSizeDesc:
+		return a.Size(sm) > b.Size(sm)
 	case tree.SortSizeAsc:
 		return a.Size(sm) < b.Size(sm)
 	case tree.SortCountDesc:
@@ -113,7 +115,7 @@ func treeNodeLess(a, b *tree.Node, mode tree.SortMode, sm tree.SizeMode) bool {
 	case tree.SortNameAsc:
 		return a.Name < b.Name
 	}
-	return a.Size(sm) > b.Size(sm)
+	return false
 }
 
 // buildExtRows precomputes the extension breakdown rows with their fractions.
@@ -135,16 +137,16 @@ func buildExtRows(root *tree.Node, sm tree.SizeMode, mode extSortMode) []extRow 
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i].ext, out[j].ext
 		switch mode {
+		case extSortSize:
+			if a.Size(sm) != b.Size(sm) {
+				return a.Size(sm) > b.Size(sm)
+			}
 		case extSortCount:
 			if a.Count != b.Count {
 				return a.Count > b.Count
 			}
 		case extSortName:
 			return a.Ext < b.Ext
-		default:
-			if a.Size(sm) != b.Size(sm) {
-				return a.Size(sm) > b.Size(sm)
-			}
 		}
 		return a.Ext < b.Ext
 	})
@@ -172,7 +174,7 @@ func (m *model) rememberSelection() {
 		if m.cursor >= 0 && m.cursor < len(m.topRows) {
 			m.selectedFile = m.topRows[m.cursor].file.Rel
 		}
-	default:
+	case viewTree, viewHelp:
 		if r := m.currentRow(); r != nil {
 			m.selectedPath = r.node.Path()
 		}
@@ -185,7 +187,7 @@ func (m *model) restoreSelection() {
 		m.restoreExtSelection()
 	case viewLargest:
 		m.restoreFileSelection()
-	default:
+	case viewTree, viewHelp:
 		m.restoreTreeSelection()
 	}
 }

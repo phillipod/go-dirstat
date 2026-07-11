@@ -46,7 +46,7 @@ func ownership(info fs.FileInfo) (uid, gid, owner, group string) {
 	return uid, gid, owner, group
 }
 
-func volumeFor(path string) (Volume, error) {
+func platformVolumeFor(path string) (Volume, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
 		return Volume{}, fmt.Errorf("statfs %q: %w", path, err)

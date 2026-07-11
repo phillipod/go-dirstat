@@ -32,12 +32,12 @@ func runText(cmd *cobra.Command, c *Config) error {
 	multiple := len(paths) > 1
 
 	for i, p := range paths {
-		if c.Format == "text" && multiple && i > 0 {
+		if c.Format == outputFormatText && multiple && i > 0 {
 			if _, err := fmt.Fprintln(out); err != nil {
 				return fmt.Errorf("write output separator: %w", err)
 			}
 		}
-		if c.Format == "text" && multiple {
+		if c.Format == outputFormatText && multiple {
 			if _, err := fmt.Fprintf(out, "%s:\n", format.SafeText(p)); err != nil {
 				return fmt.Errorf("write root heading: %w", err)
 			}
@@ -46,7 +46,7 @@ func runText(cmd *cobra.Command, c *Config) error {
 		if err != nil {
 			return fmt.Errorf("%q: %w", p, err)
 		}
-		if c.Format == "tsv" {
+		if c.Format == outputFormatTSV {
 			if err := render.TSV(out, root, p, topts); err != nil {
 				return fmt.Errorf("render %q: %w", p, err)
 			}

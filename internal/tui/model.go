@@ -39,12 +39,14 @@ const (
 
 func (m extSortMode) String() string {
 	switch m {
+	case extSortSize:
+		return "size"
 	case extSortCount:
 		return "count"
 	case extSortName:
 		return "name"
 	default:
-		return "size"
+		return "unknown"
 	}
 }
 
@@ -231,7 +233,7 @@ func (m *model) selectedAbsolutePath() string {
 		if r := m.currentRow(); r != nil {
 			rel = r.node.Path()
 		}
-	default:
+	case viewExt, viewHelp:
 		return ""
 	}
 	if rel == "" || rel == "." {

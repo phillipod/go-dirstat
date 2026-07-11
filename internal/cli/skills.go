@@ -79,7 +79,7 @@ func newSkillInstallCommand() *cobra.Command {
 		Short: "Install dirstat skill definitions",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			locations, profiles, err := resolveSkillLocations(cmd, flags, args)
+			locations, profiles, err := resolveSkillLocations(flags, args)
 			if err != nil {
 				return err
 			}
@@ -146,7 +146,7 @@ func newSkillStatusCommand() *cobra.Command {
 		Short: "Show dirstat skill installation status",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			locations, _, err := resolveSkillLocations(cmd, flags, args)
+			locations, _, err := resolveSkillLocations(flags, args)
 			if err != nil {
 				return err
 			}
@@ -169,7 +169,7 @@ func newSkillRemoveCommand() *cobra.Command {
 		Short: "Remove dirstat skill definitions",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			locations, _, err := resolveSkillLocations(cmd, flags, args)
+			locations, _, err := resolveSkillLocations(flags, args)
 			if err != nil {
 				return err
 			}
@@ -199,7 +199,7 @@ func bindSkillLocationFlags(cmd *cobra.Command, flags *skillFlags) {
 	cmd.Flags().StringVar(&flags.claudePath, "claude-path", "", "exact Claude SKILL.md destination")
 }
 
-func resolveSkillLocations(cmd *cobra.Command, flags skillFlags, values []string) ([]agentskills.Location, []agentskills.Profile, error) {
+func resolveSkillLocations(flags skillFlags, values []string) ([]agentskills.Location, []agentskills.Profile, error) {
 	targets, err := agentskills.ParseTargets(values)
 	if err != nil {
 		return nil, nil, err

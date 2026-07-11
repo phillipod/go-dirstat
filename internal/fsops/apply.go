@@ -19,6 +19,11 @@ import (
 	"github.com/phillipod/go-dirstat/internal/fsinfo"
 )
 
+const (
+	archiveFormatZIP   = "zip"
+	archiveFormatTarGZ = "tar.gz"
+)
+
 func DefaultAuditPath(root string) string { return filepath.Join(root, ".dirstat-audit.jsonl") }
 
 func OpenAudit(path string) (*os.File, error) {
@@ -33,7 +38,7 @@ func OpenAudit(path string) (*os.File, error) {
 	return f, nil
 }
 
-func apply(ctx context.Context, plan Plan, opts ApplyOptions) ([]Result, error) {
+func applyPlan(ctx context.Context, plan Plan, opts ApplyOptions) ([]Result, error) {
 	if plan.Header.Version != PlanVersion {
 		return nil, fmt.Errorf("unsupported plan version %d", plan.Header.Version)
 	}
@@ -278,6 +283,7 @@ func preflight(ctx context.Context, op Operation, src, dst string, policy Confli
 		if !parent.IsDir() {
 			return errors.New("source parent is not a directory")
 		}
+	case ActionDelete, ActionCopy, ActionMove, ActionRename, ActionTruncate, ActionChmod, ActionChown, ActionArchive, ActionExtract:
 	}
 	switch op.Action {
 	case ActionTouch, ActionTruncate, ActionChmod, ActionChown, ActionExtract:
@@ -286,6 +292,7 @@ func preflight(ctx context.Context, op Operation, src, dst string, policy Confli
 				return err
 			}
 		}
+	case ActionDelete, ActionCopy, ActionMove, ActionRename, ActionMkdir, ActionArchive:
 	}
 	if op.Action == ActionCopy {
 		info, err := os.Lstat(src)
@@ -361,6 +368,7 @@ func validateParameters(op Operation, src, dst string) error {
 		if op.UID == nil && op.GID == nil {
 			return errors.New("chown uid or gid is required")
 		}
+	case ActionDelete, ActionMkdir, ActionTouch:
 	}
 	if (op.Action == ActionArchive || op.Action == ActionExtract) && archiveFormat(src, op.Format) == "invalid" {
 		return fmt.Errorf("unsupported archive format %q", op.Format)
@@ -686,12 +694,12 @@ func archivePathNew(ctx context.Context, src, dst, format string) (err error) {
 			_ = os.Remove(dst)
 		}
 	}()
-	if archiveFormat(dst, format) == "zip" {
+	if archiveFormat(dst, format) == archiveFormatZIP {
 		return writeZip(ctx, f, src)
 	}
 	var w io.Writer = f
 	var gz *gzip.Writer
-	if archiveFormat(dst, format) == "tar.gz" {
+	if archiveFormat(dst, format) == archiveFormatTarGZ {
 		gz = gzip.NewWriter(f)
 		w = gz
 	}
@@ -757,7 +765,7 @@ func extractArchive(ctx context.Context, src, dst, format string, policy Conflic
 }
 
 func validateArchive(ctx context.Context, src, format string) error {
-	if archiveFormat(src, format) == "zip" {
+	if archiveFormat(src, format) == archiveFormatZIP {
 		zr, err := zip.OpenReader(src)
 		if err != nil {
 			return err
@@ -791,7 +799,7 @@ func validateArchive(ctx context.Context, src, format string) error {
 	}
 	defer func() { _ = f.Close() }()
 	var r io.Reader = f
-	if archiveFormat(src, format) == "tar.gz" {
+	if archiveFormat(src, format) == archiveFormatTarGZ {
 		gz, err := gzip.NewReader(f)
 		if err != nil {
 			return err
@@ -842,14 +850,14 @@ func extractArchiveNew(ctx context.Context, src, dst, format string) (err error)
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	if archiveFormat(src, format) == "zip" {
+	if archiveFormat(src, format) == archiveFormatZIP {
 		if err := f.Close(); err != nil {
 			return err
 		}
 		return extractZip(ctx, src, dst)
 	}
 	var r io.Reader = f
-	if archiveFormat(src, format) == "tar.gz" {
+	if archiveFormat(src, format) == archiveFormatTarGZ {
 		gz, e := gzip.NewReader(f)
 		if e != nil {
 			return e
@@ -922,19 +930,19 @@ func extractArchiveNew(ctx context.Context, src, dst, format string) (err error)
 func archiveFormat(path, format string) string {
 	format = strings.ToLower(format)
 	if format == "tgz" || format == "gzip" {
-		return "tar.gz"
+		return archiveFormatTarGZ
 	}
-	if format == "tar" || format == "tar.gz" || format == "zip" {
+	if format == "tar" || format == archiveFormatTarGZ || format == archiveFormatZIP {
 		return format
 	}
 	if format != "" {
 		return "invalid"
 	}
 	if strings.HasSuffix(strings.ToLower(path), ".tgz") || strings.HasSuffix(strings.ToLower(path), ".tar.gz") {
-		return "tar.gz"
+		return archiveFormatTarGZ
 	}
 	if strings.HasSuffix(strings.ToLower(path), ".zip") {
-		return "zip"
+		return archiveFormatZIP
 	}
 	return "tar"
 }

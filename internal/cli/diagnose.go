@@ -19,14 +19,14 @@ func newDiagnoseCommand() *cobra.Command {
 		Short: "Explain filesystem pressure and open-deleted files",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if output != "text" && output != "json" {
+			if output != outputFormatText && output != outputFormatJSON {
 				return fmt.Errorf("invalid --format %q: expected text or json", output)
 			}
 			if len(args) == 0 {
 				args = []string{"."}
 			}
 			result := diagnose.Gather(cmd.Context(), args)
-			if output == "json" {
+			if output == outputFormatJSON {
 				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(result); err != nil {
 					return fmt.Errorf("encode diagnostics: %w", err)
 				}

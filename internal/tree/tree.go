@@ -37,6 +37,8 @@ const (
 // String returns the flag-friendly name of a sort mode.
 func (m SortMode) String() string {
 	switch m {
+	case SortSizeDesc:
+		return "size"
 	case SortSizeAsc:
 		return "size-asc"
 	case SortCountDesc:
@@ -46,7 +48,7 @@ func (m SortMode) String() string {
 	case SortNameAsc:
 		return "name"
 	default:
-		return "size"
+		return "unknown"
 	}
 }
 
@@ -162,6 +164,8 @@ func (n *Node) Sort(mode SortMode, sm SizeMode) {
 
 func less(a, b *Node, mode SortMode, sm SizeMode) bool {
 	switch mode {
+	case SortSizeDesc:
+		return a.Size(sm) > b.Size(sm)
 	case SortSizeAsc:
 		return a.Size(sm) < b.Size(sm)
 	case SortCountDesc:
@@ -173,22 +177,21 @@ func less(a, b *Node, mode SortMode, sm SizeMode) bool {
 	case SortNameAsc:
 		return a.Name < b.Name
 	}
-	// SortSizeDesc default.
-	return a.Size(sm) > b.Size(sm)
+	return false
 }
 
 // Clone returns a deep copy of n and its subtree with parent pointers relinked
 // within the copy. It is used to snapshot a tree that a concurrent scan is still
 // mutating, so a reader (e.g. the TUI) gets a stable, owned view.
 func (n *Node) Clone() *Node {
-	return n.clone(nil)
+	return n.cloneNode(nil)
 }
 
-func (n *Node) clone(parent *Node) *Node {
+func (n *Node) cloneNode(parent *Node) *Node {
 	c := n.copyFields(parent)
 	c.Children = make([]*Node, len(n.Children))
 	for i, ch := range n.Children {
-		c.Children[i] = ch.clone(c)
+		c.Children[i] = ch.cloneNode(c)
 	}
 	return c
 }

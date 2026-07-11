@@ -121,7 +121,7 @@ func VolumeFor(path string) (Volume, error) {
 	if err != nil {
 		return Volume{}, err
 	}
-	v, err := volumeFor(abs)
+	v, err := platformVolumeFor(abs)
 	if err != nil {
 		return Volume{}, err
 	}

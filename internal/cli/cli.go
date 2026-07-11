@@ -65,6 +65,15 @@ type Config struct {
 // memory on a wide tree.
 const maxJobs = 4096
 
+const (
+	outputFormatText    = "text"
+	outputFormatJSON    = "json"
+	outputFormatTSV     = "tsv"
+	outputFormatJSONL   = "jsonl"
+	outputFormatNUL     = "nul"
+	queryFieldSizeHuman = "size-human"
+)
+
 // newConfig returns Config with the built-in defaults. Cobra overrides fields
 // via bound flags; this just seeds values cobra cannot express as a zero value.
 func newConfig() *Config {
@@ -136,7 +145,7 @@ func (c *Config) validate() error {
 	if !validSortMode(c.Sort) {
 		return fmt.Errorf("invalid --sort %q: expected size, size-asc, count, mtime, or name", c.Sort)
 	}
-	if c.Format != "text" && c.Format != "tsv" {
+	if c.Format != outputFormatText && c.Format != outputFormatTSV {
 		return fmt.Errorf("invalid --format %q: expected text or tsv", c.Format)
 	}
 	if c.Format == "tsv" && c.ByExt {

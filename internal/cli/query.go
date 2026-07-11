@@ -35,6 +35,11 @@ type queryFlags struct {
 	maxSize    string
 }
 
+const (
+	queryFieldSize           = "size"
+	queryFieldAllocatedHuman = "allocated-human"
+)
+
 func newQueryCommand(cfg *Config) *cobra.Command {
 	qf := queryFlags{}
 	cmd := &cobra.Command{
@@ -46,7 +51,7 @@ func newQueryCommand(cfg *Config) *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&qf.output, "format", "tsv", "output format: tsv|jsonl|nul")
+	f.StringVar(&qf.output, "format", outputFormatTSV, "output format: tsv|jsonl|nul")
 	f.StringVar(&qf.fields, "fields", "path,kind,size,size-human,mtime", "comma-separated TSV fields, including raw or *-human sizes")
 	f.StringVar(&qf.minSize, "min-size", "", "include candidates at least SIZE in the selected size mode")
 	f.StringVar(&qf.maxSize, "max-size", "", "include candidates no larger than SIZE in the selected size mode")
@@ -64,7 +69,7 @@ func newQueryCommand(cfg *Config) *cobra.Command {
 }
 
 func runQuery(cmd *cobra.Command, cfg *Config, flags queryFlags, paths []string) error {
-	if flags.output != "tsv" && flags.output != "jsonl" && flags.output != "nul" {
+	if flags.output != outputFormatTSV && flags.output != outputFormatJSONL && flags.output != outputFormatNUL {
 		return fmt.Errorf("invalid --format %q: expected tsv, jsonl, or nul", flags.output)
 	}
 	older, err := parseQueryAge("older-than", flags.older)
@@ -79,7 +84,7 @@ func runQuery(cmd *cobra.Command, cfg *Config, flags queryFlags, paths []string)
 	if err != nil {
 		return err
 	}
-	if flags.output == "nul" && cmd.Flags().Changed("fields") {
+	if flags.output == outputFormatNUL && cmd.Flags().Changed("fields") {
 		return fmt.Errorf("--fields cannot be used with --format=nul; NUL output is always the absolute path")
 	}
 	kinds, err := parseQueryKinds(flags.kinds)
@@ -145,13 +150,13 @@ func runQuery(cmd *cobra.Command, cfg *Config, flags queryFlags, paths []string)
 			return fmt.Errorf("query %q: %w", path, err)
 		}
 		switch flags.output {
-		case "jsonl":
+		case outputFormatJSONL:
 			if cmd.Flags().Changed("fields") {
 				err = writeQueryJSONL(cmd.OutOrStdout(), records, fields, cfg.sizeMode())
 			} else {
 				err = querypkg.WriteJSONL(cmd.OutOrStdout(), records)
 			}
-		case "nul":
+		case outputFormatNUL:
 			err = querypkg.WriteNUL(cmd.OutOrStdout(), records)
 		default:
 			err = writeQueryTSV(cmd.OutOrStdout(), records, fields, cfg.sizeMode())
@@ -246,7 +251,7 @@ func parseQueryFields(value string) ([]queryOutputField, bool, error) {
 			return nil, false, fmt.Errorf("--fields must not contain an empty field")
 		}
 		switch name {
-		case "size", "size-human", "apparent-human", "allocated-human":
+		case queryFieldSize, queryFieldSizeHuman, "apparent-human", queryFieldAllocatedHuman:
 			fields = append(fields, queryOutputField{name: name, sized: name})
 		default:
 			field, ok := queryRawFields[name]
@@ -255,6 +260,9 @@ func parseQueryFields(value string) ([]queryOutputField, bool, error) {
 			}
 			fields = append(fields, queryOutputField{name: name, raw: field})
 			switch field {
+			case querypkg.FieldPath, querypkg.FieldRelative, querypkg.FieldName, querypkg.FieldExtension,
+				querypkg.FieldKind, querypkg.FieldApparent, querypkg.FieldAllocated, querypkg.FieldFiles,
+				querypkg.FieldDirectories, querypkg.FieldMTime, querypkg.FieldHardlink, querypkg.FieldScanError:
 			case querypkg.FieldOwner, querypkg.FieldGroup, querypkg.FieldUID, querypkg.FieldGID,
 				querypkg.FieldMode, querypkg.FieldModeText, querypkg.FieldLinks,
 				querypkg.FieldDevice, querypkg.FieldFileID, querypkg.FieldMetadataError:
@@ -284,9 +292,9 @@ func queryJSONValue(record querypkg.Record, field queryOutputField, mode tree.Si
 	if field.sized != "" {
 		value := record.Apparent
 		switch field.sized {
-		case "allocated-human":
+		case queryFieldAllocatedHuman:
 			value = record.Allocated
-		case "size", "size-human":
+		case queryFieldSize, queryFieldSizeHuman:
 			if mode == tree.SizeOnDisk {
 				value = record.Allocated
 			}
@@ -297,6 +305,8 @@ func queryJSONValue(record querypkg.Record, field queryOutputField, mode tree.Si
 		return value
 	}
 	switch field.raw {
+	case querypkg.FieldPath:
+		return record.Path
 	case querypkg.FieldRelative:
 		return record.Relative
 	case querypkg.FieldName:
@@ -358,9 +368,9 @@ func writeQueryTSV(w io.Writer, records []querypkg.Record, fields []queryOutputF
 			if field.sized != "" {
 				value := record.Apparent
 				switch field.sized {
-				case "allocated-human":
+				case queryFieldAllocatedHuman:
 					value = record.Allocated
-				case "size", "size-human":
+				case queryFieldSize, queryFieldSizeHuman:
 					if mode == tree.SizeOnDisk {
 						value = record.Allocated
 					}

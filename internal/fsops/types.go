@@ -166,5 +166,5 @@ func ReadResults(r io.Reader) ([]Result, error) {
 }
 
 func Apply(ctx context.Context, plan Plan, opts ApplyOptions) ([]Result, error) {
-	return apply(ctx, plan, opts)
+	return applyPlan(ctx, plan, opts)
 }

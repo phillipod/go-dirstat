@@ -119,6 +119,8 @@ func WriteNUL(w io.Writer, records []Record) error {
 
 func fieldValue(r Record, field Field) string {
 	switch field {
+	case FieldPath:
+		return r.Path
 	case FieldRelative:
 		return r.Relative
 	case FieldName:
@@ -165,7 +167,7 @@ func fieldValue(r Record, field Field) string {
 	case FieldMetadataError:
 		return r.MetadataError
 	default:
-		return r.Path
+		return ""
 	}
 }
 

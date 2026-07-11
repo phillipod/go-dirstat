@@ -20,7 +20,7 @@ func newStatusCommand() *cobra.Command {
 		Short: "Show filesystem capacity and inode pressure",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if output != "text" && output != "json" {
+			if output != outputFormatText && output != outputFormatJSON {
 				return fmt.Errorf("invalid --format %q: expected text or json", output)
 			}
 			if len(args) == 0 {
@@ -34,7 +34,7 @@ func newStatusCommand() *cobra.Command {
 					return err
 				}
 				v.Filesystem = policy.FSOf(v.Path)
-				if output == "json" {
+				if output == outputFormatJSON {
 					if err := enc.Encode(v); err != nil {
 						return err
 					}

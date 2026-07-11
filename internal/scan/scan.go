@@ -385,7 +385,7 @@ func (lt *liveTree) stats() Stats {
 // propagateSelf spreads a directory's own inode allocation and mtime up to its
 // ancestors. The node's Alloc already holds its own inode allocation; only the
 // ancestors need updating. Called once when a directory begins streaming.
-func (lt *liveTree) propagateSelf(n *tree.Node) {
+func (*liveTree) propagateSelf(n *tree.Node) {
 	alloc, mtime := n.Alloc, n.ModTime
 	for p := n.Parent(); p != nil; p = p.Parent() {
 		p.Alloc += alloc
@@ -397,7 +397,7 @@ func (lt *liveTree) propagateSelf(n *tree.Node) {
 
 // propagateFile adds a freshly-adopted file/error leaf's contribution to every
 // ancestor (its own fields are already final).
-func (lt *liveTree) propagateFile(leaf *tree.Node) {
+func (*liveTree) propagateFile(leaf *tree.Node) {
 	apparent, alloc, mtime := leaf.Apparent, leaf.Alloc, leaf.ModTime
 	for p := leaf.Parent(); p != nil; p = p.Parent() {
 		p.Apparent += apparent
@@ -416,7 +416,7 @@ func (lt *liveTree) propagateFile(leaf *tree.Node) {
 // bumpDirCount records that a new directory exists by incrementing every
 // ancestor's DirCount. The directory's own subtree counts propagate later, as it
 // is scanned, via propagateFile/bumpDirCount on each of its entries.
-func (lt *liveTree) bumpDirCount(child *tree.Node) {
+func (*liveTree) bumpDirCount(child *tree.Node) {
 	for p := child.Parent(); p != nil; p = p.Parent() {
 		p.DirCount++
 	}
@@ -806,7 +806,7 @@ func (s *scanner) normalizeFileOwners() {
 }
 
 // makeFile builds a leaf file node from its stat info.
-func (s *scanner) makeFile(name string, info fs.FileInfo, depth int) *tree.Node {
+func (*scanner) makeFile(name string, info fs.FileInfo, depth int) *tree.Node {
 	return &tree.Node{
 		Name:     name,
 		IsDir:    false,
@@ -820,7 +820,7 @@ func (s *scanner) makeFile(name string, info fs.FileInfo, depth int) *tree.Node 
 // hardlinkNode builds a zero-size leaf for an already-counted file identity: it
 // keeps the name and mtime so a hardlink or followed alias remains visible and
 // sortable without contributing the same bytes twice.
-func (s *scanner) hardlinkNode(name string, info fs.FileInfo, depth int) *tree.Node {
+func (*scanner) hardlinkNode(name string, info fs.FileInfo, depth int) *tree.Node {
 	return &tree.Node{
 		Name:     name,
 		IsDir:    false,

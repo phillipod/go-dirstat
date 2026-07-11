@@ -31,12 +31,10 @@ vet: ## Run go vet
 fmt: ## Format source
 	gofmt -s -w $(GOFILES)
 
-lint: vet ## Lint (requires golangci-lint on PATH if available)
-	@if command -v golangci-lint >/dev/null 2>&1; then \
-		golangci-lint run ./...; \
-	else \
-		echo "golangci-lint not installed; skipped"; \
-	fi
+lint: vet ## Enforce the repository golangci-lint policy
+	golangci-lint config verify
+	golangci-lint fmt --diff
+	golangci-lint run ./...
 
 tidy: ## Tidy module graph
 	go mod tidy

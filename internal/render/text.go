@@ -260,7 +260,7 @@ func (r *textRenderer) columns(n *tree.Node, name string) string {
 }
 
 // countField renders "12d 1,204f"-style subtree counts.
-func (r *textRenderer) countField(n *tree.Node) string {
+func (*textRenderer) countField(n *tree.Node) string {
 	if !n.IsDir {
 		return ""
 	}

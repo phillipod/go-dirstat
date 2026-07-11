@@ -43,7 +43,7 @@ func linkCount(path string, _ fs.FileInfo) uint64 {
 
 func ownership(fs.FileInfo) (string, string, string, string) { return "", "", "", "" }
 
-func volumeFor(path string) (Volume, error) {
+func platformVolumeFor(path string) (Volume, error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return Volume{}, err

@@ -172,7 +172,7 @@ func (s *Store) prune(root, fingerprint string) error {
 	return nil
 }
 
-func (s *Store) loadPath(path, root, fingerprint string) (*index.Snapshot, error) {
+func (*Store) loadPath(path, root, fingerprint string) (*index.Snapshot, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

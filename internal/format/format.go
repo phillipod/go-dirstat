@@ -34,11 +34,12 @@ func SafeText(s string) string {
 			b.WriteString(`\r`)
 		default:
 			if unicode.IsControl(r) {
-				if r <= 0xff {
+				switch {
+				case r <= 0xff:
 					writeByteEscape(&b, byte(r))
-				} else if r <= 0xffff {
+				case r <= 0xffff:
 					writeRuneEscape(&b, `\u`, r, 4)
-				} else {
+				default:
 					writeRuneEscape(&b, `\U`, r, 8)
 				}
 			} else {

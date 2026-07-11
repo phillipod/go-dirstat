@@ -89,6 +89,11 @@ jobs:
           version: v2.11.4
           args: --timeout=5m
 
+      - name: Verify lint configuration and formatting
+        run: |
+          golangci-lint config verify
+          golangci-lint fmt --diff
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest

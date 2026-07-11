@@ -337,6 +337,8 @@ func sortRecords(records []Record, keys []SortKey) {
 
 func compare(a, b Record, field SortField) int {
 	switch field {
+	case SortPath:
+		return strings.Compare(a.Relative, b.Relative)
 	case SortApparent:
 		return compareInt64(a.Apparent, b.Apparent)
 	case SortAllocated:
@@ -358,7 +360,7 @@ func compare(a, b Record, field SortField) int {
 	case SortKind:
 		return strings.Compare(string(a.Kind), string(b.Kind))
 	default:
-		return strings.Compare(a.Relative, b.Relative)
+		return 0
 	}
 }
 
