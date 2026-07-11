@@ -261,11 +261,30 @@ func historyKey(cfg *Config, path, storeDir string) (string, scope.Policy, strin
 }
 
 func resolvedPath(path string) string {
-	resolved, err := filepath.EvalSymlinks(path)
+	abs, err := filepath.Abs(filepath.Clean(path))
 	if err != nil {
 		return filepath.Clean(path)
 	}
-	return filepath.Clean(resolved)
+	current := abs
+	var missing []string
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(current)
+		if resolveErr == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		if !errors.Is(resolveErr, fs.ErrNotExist) {
+			return filepath.Clean(path)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(path)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func pathContainedBy(parent, child string) (bool, string) {
