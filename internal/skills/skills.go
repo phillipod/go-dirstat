@@ -168,23 +168,60 @@ func profileMetadata(profile Profile) (string, string) {
 func body(profile Profile, rules string) []byte {
 	common := `# dirstat
 
-Use **dirstat** to investigate disk pressure before proposing cleanup.
+Use **dirstat** to establish disk pressure, locate specific candidates, and make a reviewable cleanup decision. Start with **dirstat --help** or **dirstat COMMAND --help** if a flag is uncertain; do not invent flags or parse display output as data.
 
-## Read-only investigation
+## How to investigate
 
-- Start with **dirstat status PATH** for capacity and inode pressure.
-- Use **dirstat query** for scriptable candidate lists, **dirstat inspect** for metadata or bounded content previews, and **dirstat history growth** to compare scans.
-- Use **dirstat tui PATH** when an interactive tree, extension breakdown, largest-file view, or previews will help.
-- State the evidence behind every proposed cleanup: path, size, age or growth, and why it is safe to consider.
+1. Establish capacity and inode pressure:
+
+       dirstat status /srv
+       dirstat status --format=json /srv
+       dirstat diagnose --format=json /srv
+
+   Use **diagnose** when host-level evidence is needed, especially to identify open-but-deleted files that consume space without appearing in the directory tree.
+
+2. Find where space is concentrated. The default command shows a hierarchy; extensions groups space by file type:
+
+       dirstat --depth 3 --limit 25 /srv
+       dirstat extensions /srv
+       dirstat --apparent --by-ext /srv
+
+   The default is allocated bytes, stays on one filesystem, skips virtual filesystems, and does not follow symlinks. Use **--apparent** for logical file sizes, **--bytes** for raw bytes, **--files** to include individual files, and **--cross-device** or **--follow** only when explicitly required. Narrow a scan with **--exclude**, **--exclude-path**, **--include-path**, **--include-fs**, or **--exclude-fs**.
+
+3. Produce precise candidates with **query**. TSV is headerless and configurable; JSONL is structured; NUL emits only absolute paths and is safest for unusual names:
+
+       dirstat query --kind=file --min-size=1G --format=tsv \
+         --fields=path,size,size-human,mtime /srv
+       dirstat query --kind=file --extension=log --older-than=30d \
+         --sort=size:desc --format=jsonl /srv
+       dirstat query --kind=file --path-regexp='\.tmp$' --format=nul /srv
+
+   Add **--metadata** when owner, group, mode, link count, or stable identity belongs in the candidate evidence.
+
+4. Verify a candidate before proposing it. **inspect** reports type, size, allocation, ownership, links, and time; **--content** reads only a bounded preview. **history growth** records a scan and compares it with the prior one:
+
+       dirstat inspect --format=json /srv/archive/old.log
+       dirstat inspect --content --limit=65536 /srv/archive/old.log
+       dirstat history growth /srv
+
+## Evidence to report
+
+- Name the filesystem/root, selected size mode (allocated or apparent), and command used.
+- For each proposed candidate, give path, size, age or growth evidence, owner/type when relevant, and why it is safe to consider.
+- Prefer **query --format=jsonl** or **--format=nul** for automation. Do not scrape the visual tree or human-size columns.
 `
 	switch profile {
 	case ProfileOperator:
 		return []byte(common + `
 ## Guarded operator workflow
 
-- You may create guarded plans with **dirstat plan** and validate them with **dirstat apply --dry-run**.
-- Do not run **dirstat apply --yes**, confirm a mutating TUI action, or otherwise delete, move, truncate, or overwrite files without the user's explicit authorization.
-- Respect scope flags and the configured audit trail. Do not disable audit logging or loosen filesystem or symlink boundaries unless the user explicitly asks.
+- Create one scoped plan per intended action, then validate it:
+
+      dirstat plan delete --root /srv /srv/archive/old.log -o cleanup.jsonl
+      dirstat apply --dry-run cleanup.jsonl
+
+- You may create plans and run dry-runs. Do not run **dirstat apply --yes**, confirm a mutating TUI action, or otherwise delete, move, truncate, or overwrite files without the user's explicit authorization.
+- Keep the plan root narrow. Respect configured audit logging and filesystem/symlink boundaries; do not disable or loosen them unless the user explicitly asks.
 `)
 	case ProfileAdministrator:
 		return []byte(common + `
@@ -197,7 +234,7 @@ The policy below was supplied when this skill was installed. It is the complete 
 		return []byte(common + `
 ## Safety boundary
 
-- Propose cleanup actions first. Do not create mutating TUI actions, delete, move, truncate, overwrite, or run **dirstat apply --yes** without the user's explicit authorization.
+- Propose cleanup actions first. Do not delete, move, truncate, overwrite, or run **dirstat apply --yes** without the user's explicit authorization.
 - Keep audit logging and filesystem/symlink boundaries enabled unless the user explicitly directs otherwise.
 `)
 	}

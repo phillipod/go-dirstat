@@ -30,6 +30,18 @@ func TestDefinitionsArePortableAndTamperEvident(t *testing.T) {
 			if tc.profile == ProfileAdministrator && !bytes.Contains(definition, []byte(tc.rules)) {
 				t.Fatal("administrator rules were not copied into the definition")
 			}
+			for _, command := range []string{
+				"dirstat status --format=json /srv",
+				"dirstat diagnose --format=json /srv",
+				"dirstat extensions /srv",
+				"dirstat query --kind=file --min-size=1G --format=tsv",
+				"dirstat inspect --format=json /srv/archive/old.log",
+				"dirstat history growth /srv",
+			} {
+				if !bytes.Contains(definition, []byte(command)) {
+					t.Fatalf("definition missing command guide %q:\n%s", command, definition)
+				}
+			}
 			if got := managedState(definition, tc.profile); got != StateInstalled {
 				t.Fatalf("managed state = %q, want installed", got)
 			}
