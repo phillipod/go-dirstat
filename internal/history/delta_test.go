@@ -1,6 +1,7 @@
 package history
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -29,12 +30,13 @@ func TestCompareClassifiesPathChanges(t *testing.T) {
 	for _, delta := range deltas {
 		got[delta.Path] = delta
 	}
+	root := before.Root
 	want := map[string]Change{
-		"/srv/data":        ChangeGrown,
-		"/srv/data/grow":   ChangeGrown,
-		"/srv/data/shrink": ChangeShrunk,
-		"/srv/data/gone":   ChangeRemoved,
-		"/srv/data/new":    ChangeNew,
+		root:                          ChangeGrown,
+		filepath.Join(root, "grow"):   ChangeGrown,
+		filepath.Join(root, "shrink"): ChangeShrunk,
+		filepath.Join(root, "gone"):   ChangeRemoved,
+		filepath.Join(root, "new"):    ChangeNew,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("deltas = %#v", deltas)
@@ -44,11 +46,11 @@ func TestCompareClassifiesPathChanges(t *testing.T) {
 			t.Errorf("%s change = %q, want %q", path, got[path].Change, change)
 		}
 	}
-	if got["/srv/data/shrink"].AllocatedDelta != -30 {
-		t.Errorf("shrink delta = %d", got["/srv/data/shrink"].AllocatedDelta)
+	if got[filepath.Join(root, "shrink")].AllocatedDelta != -30 {
+		t.Errorf("shrink delta = %d", got[filepath.Join(root, "shrink")].AllocatedDelta)
 	}
-	if got["/srv/data/gone"].AfterAlloc != 0 {
-		t.Errorf("removed after = %d", got["/srv/data/gone"].AfterAlloc)
+	if got[filepath.Join(root, "gone")].AfterAlloc != 0 {
+		t.Errorf("removed after = %d", got[filepath.Join(root, "gone")].AfterAlloc)
 	}
 }
 
@@ -68,7 +70,7 @@ func TestCompareRejectsDifferentKeysAndMalformedLayout(t *testing.T) {
 
 func deltaSnapshot(nodes []index.FlatNode) *index.Snapshot {
 	return &index.Snapshot{
-		Root: "/srv/data", Fingerprint: "fp", ScannedAt: time.Now(),
+		Root: filepath.Join(string(filepath.Separator), "srv", "data"), Fingerprint: "fp", ScannedAt: time.Now(),
 		Nodes: nodes,
 	}
 }

@@ -27,6 +27,9 @@ type Config struct {
 func Default() Config { return Config{HistoryMax: 20} }
 
 func Path() (string, error) {
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return filepath.Join(dir, "dirstat", "config.json"), nil
+	}
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err

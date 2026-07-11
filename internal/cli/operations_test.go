@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -20,14 +21,19 @@ func TestPlanCommandWritesVersionedExpectedMetadata(t *testing.T) {
 	}
 	out := executeOperationCLI(t, nil, "plan", "--root", root, "delete", "large.log")
 	plan := readCLIPlan(t, out)
-	if plan.Header.Version != fsops.PlanVersion || plan.Header.Root != root || len(plan.Operations) != 1 {
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalSource := filepath.Join(canonicalRoot, "large.log")
+	if plan.Header.Version != fsops.PlanVersion || plan.Header.Root != canonicalRoot || len(plan.Operations) != 1 {
 		t.Fatalf("plan = %#v", plan)
 	}
 	op := plan.Operations[0]
-	if op.Action != fsops.ActionDelete || op.Source != source || op.Expected == nil {
+	if op.Action != fsops.ActionDelete || op.Source != canonicalSource || op.Expected == nil {
 		t.Fatalf("operation = %#v", op)
 	}
-	if op.Expected.Path != source || op.Expected.Size != 7 || op.Expected.Kind != "file" {
+	if op.Expected.Path != canonicalSource || op.Expected.Size != 7 || op.Expected.Kind != "file" {
 		t.Fatalf("expected = %#v", op.Expected)
 	}
 	if _, err := os.Stat(source); err != nil {
@@ -149,7 +155,7 @@ func TestPlanCommandWritesPrivateFileWithoutOverwriting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("plan mode = %o", info.Mode().Perm())
 	}
 	cmd = New()
@@ -205,7 +211,7 @@ func TestApplyMutatesAuditsAndSupportsNoAudit(t *testing.T) {
 		t.Fatalf("source remains: %v", err)
 	}
 	audit := filepath.Join(state, "dirstat", "operations.jsonl")
-	if info, err := os.Stat(audit); err != nil || info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(audit); err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit info = %v, %v", info, err)
 	}
 

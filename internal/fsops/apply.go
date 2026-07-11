@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -148,8 +149,8 @@ func execute(ctx context.Context, root string, op Operation, dry bool, policy Co
 	}
 	if op.Expected != nil {
 		if op.Expected.Path != "" {
-			expectedPath, pathErr := filepath.Abs(filepath.Clean(op.Expected.Path))
-			if pathErr != nil || expectedPath != src {
+			expectedPath, pathErr := canonicalNoFollowPath(op.Expected.Path)
+			if pathErr != nil || !samePath(expectedPath, src) {
 				return errors.New("stale source: expected path does not match operation source")
 			}
 		}
@@ -396,27 +397,31 @@ func confinedPath(root, path string, allowMissing bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !within(root, abs) {
-		return "", fmt.Errorf("%q escapes root %q", abs, root)
-	}
-	if abs == root {
-		if _, err := os.Lstat(abs); err != nil && (!allowMissing || !errors.Is(err, fs.ErrNotExist)) {
-			return "", err
-		}
-		return abs, nil
-	}
 	parent := filepath.Dir(abs)
 	resolved, err := evalExisting(parent)
 	if err != nil {
 		return "", err
 	}
-	if !within(root, resolved) {
-		return "", fmt.Errorf("resolved parent %q escapes root %q", resolved, root)
+	abs = filepath.Join(resolved, filepath.Base(abs))
+	if !within(root, abs) {
+		return "", fmt.Errorf("resolved path %q escapes root %q", abs, root)
 	}
 	if _, err := os.Lstat(abs); err != nil && (!allowMissing || !errors.Is(err, fs.ErrNotExist)) {
 		return "", err
 	}
 	return abs, nil
+}
+
+func canonicalNoFollowPath(path string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	parent, err := evalExisting(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(abs)), nil
 }
 
 func evalExisting(path string) (string, error) {
@@ -447,8 +452,18 @@ func reverse(v []string) []string {
 }
 
 func within(root, path string) bool {
+	if runtime.GOOS == "windows" {
+		root, path = strings.ToLower(root), strings.ToLower(path)
+	}
 	rel, err := filepath.Rel(root, path)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func samePath(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 func destinationReady(dst string, policy ConflictPolicy) error {

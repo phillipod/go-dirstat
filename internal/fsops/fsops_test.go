@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +92,23 @@ func TestApplyRejectsEscapingSymlinkParent(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "file")); !os.IsNotExist(err) {
 		t.Fatalf("outside file exists: %v", err)
+	}
+}
+
+func TestApplyAcceptsCanonicalAliasOfPlanRoot(t *testing.T) {
+	t.Parallel()
+	realRoot := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "root-alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	path := filepath.Join(alias, "file")
+	plan := Plan{Header: PlanHeader{Version: PlanVersion, Root: alias}, Operations: []Operation{{ID: "touch", Action: ActionTouch, Source: path}}}
+	if _, err := Apply(context.Background(), plan, ApplyOptions{DisableAudit: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(realRoot, "file")); err != nil {
+		t.Fatalf("canonical target was not created: %v", err)
 	}
 }
 
@@ -272,7 +290,7 @@ func TestApplyChainedCreateTruncateChmodAndRename(t *testing.T) {
 		t.Fatalf("results=%#v err=%v", results, err)
 	}
 	info, err := os.Stat(renamed)
-	if err != nil || info.Size() != size || info.Mode().Perm() != 0o640 {
+	if err != nil || info.Size() != size || runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
 		t.Fatalf("renamed info=%v err=%v", info, err)
 	}
 }
@@ -337,7 +355,7 @@ func TestApplyDryRunAndDefaultAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit mode = %o", info.Mode().Perm())
 	}
 	data, err := os.ReadFile(audit)
