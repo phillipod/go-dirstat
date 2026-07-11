@@ -150,7 +150,7 @@ func NewStoreAtWithPolicy(dir string, maxRecords int, policy Policy) (*Store, er
 		return nil, err
 	}
 	defer func() { _ = root.Close() }()
-	if err := root.EnsureOwnershipContext(context.Background(), stateKindHistory, false); err != nil {
+	if err := root.EnsureOwnershipForNewStoreContext(context.Background(), stateKindHistory); err != nil {
 		return nil, err
 	}
 	return store, nil

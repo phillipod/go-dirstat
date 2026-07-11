@@ -133,7 +133,10 @@ func TestOverwriteDetectsDestinationReplacementAtBackupRename(t *testing.T) {
 	op := guardedMoveOperation(t, source, destination)
 	filesystem := defaultMutationFilesystem()
 	filesystem.rename = func(oldPath, newPath string) error {
-		if samePath(oldPath, destination) && strings.HasPrefix(filepath.Base(newPath), ".dirstat-backup-") {
+		// The first rename in an overwrite is the reviewed destination into a
+		// sibling backup. Match the backup naming contract instead of relying on
+		// Windows path spelling/casing from EvalSymlinks.
+		if strings.HasPrefix(filepath.Base(newPath), ".dirstat-backup-") {
 			if err := os.Remove(oldPath); err != nil {
 				return err
 			}
@@ -169,7 +172,7 @@ func TestCrossDeviceMovePartialCleanupRetainsPublishedOverwrite(t *testing.T) {
 	}
 	writeTestFile(t, filepath.Join(destination, "old"), "old")
 	op := guardedMoveOperation(t, source, destination)
-	filesystem := forcedCrossDeviceFilesystem(t, source, destination, nil)
+	filesystem := forcedCrossDeviceFilesystem(t, destination, nil)
 	wantCleanupError := errors.New("forced source cleanup failure")
 	failPath := filepath.Join(source, "a")
 	filesystem.remove = func(path string) error {
@@ -235,7 +238,7 @@ func TestCrossDeviceMovePreservesPostCopySourceChanges(t *testing.T) {
 			}
 			writeTestFile(t, filepath.Join(source, "original"), "staged")
 			op := guardedMoveOperation(t, source, destination)
-			filesystem := forcedCrossDeviceFilesystem(t, source, destination, func() { test.mutate(t, source) })
+			filesystem := forcedCrossDeviceFilesystem(t, destination, func() { test.mutate(t, source) })
 			results, err := Apply(
 				context.Background(),
 				Plan{Header: PlanHeader{Version: PlanVersion, Root: root}, Operations: []Operation{op}},
@@ -254,7 +257,7 @@ func TestCrossDeviceMoveSuccessRemovesCapturedSource(t *testing.T) {
 	source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
 	writeTestFile(t, source, "payload")
 	op := guardedMoveOperation(t, source, destination)
-	filesystem := forcedCrossDeviceFilesystem(t, source, destination, nil)
+	filesystem := forcedCrossDeviceFilesystem(t, destination, nil)
 	results, err := Apply(
 		context.Background(),
 		Plan{Header: PlanHeader{Version: PlanVersion, Root: root}, Operations: []Operation{op}},
@@ -287,15 +290,21 @@ func guardedMoveOperation(t *testing.T, source, destination string) Operation {
 
 func forcedCrossDeviceFilesystem(
 	t *testing.T,
-	source, destination string,
+	destination string,
 	afterPublish func(),
 ) *mutationFilesystem {
 	t.Helper()
 	filesystem := defaultMutationFilesystem()
 	crossDeviceError := errors.New("forced cross-device rename")
+	forced := false
 	filesystem.crossDevice = func(err error) bool { return errors.Is(err, crossDeviceError) }
 	filesystem.publish = func(oldPath, newPath string) error {
-		if samePath(oldPath, source) && samePath(newPath, destination) {
+		// The first publication to the requested destination models EXDEV. The
+		// operation canonicalizes paths before invoking the seam, and Windows
+		// may change their spelling, so matching the destination plus one-shot
+		// state is more robust than comparing the original source string.
+		if !forced && samePath(newPath, destination) {
+			forced = true
 			return crossDeviceError
 		}
 		if err := os.Rename(oldPath, newPath); err != nil {

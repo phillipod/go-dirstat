@@ -727,10 +727,7 @@ func TestWithLockPreCanceledContextDoesNotCreateStore(t *testing.T) {
 func openTestRoot(t *testing.T) *Root {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "store")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	root, err := OpenRoot(dir)
+	root, err := EnsureRoot(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

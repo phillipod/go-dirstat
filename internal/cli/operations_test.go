@@ -64,9 +64,10 @@ func TestPlanCommandCoversEveryAction(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := []struct {
-		name, action string
-		args         []string
-		check        func(*testing.T, fsops.Operation)
+		name, action       string
+		args               []string
+		check              func(*testing.T, fsops.Operation)
+		unsupportedWindows bool
 	}{
 		{name: "delete", action: "delete", args: []string{"source"}},
 		{name: "recursive delete", action: "delete", args: []string{"--recursive", "directory"}, check: func(t *testing.T, op fsops.Operation) {
@@ -77,7 +78,7 @@ func TestPlanCommandCoversEveryAction(t *testing.T) {
 		{name: "copy", action: "copy", args: []string{"source", "copy"}},
 		{name: "move", action: "move", args: []string{"source", "moved"}},
 		{name: "rename", action: "rename", args: []string{"source", "renamed"}},
-		{name: "mkdir", action: "mkdir", args: []string{"--mode", "0750", "new-dir"}, check: func(t *testing.T, op fsops.Operation) {
+		{name: "mkdir", action: "mkdir", args: []string{"--mode", "0750", "new-dir"}, unsupportedWindows: true, check: func(t *testing.T, op fsops.Operation) {
 			if op.Expected != nil || op.Mode == nil || *op.Mode != 0o750 {
 				t.Fatalf("mkdir operation = %#v", op)
 			}
@@ -88,8 +89,8 @@ func TestPlanCommandCoversEveryAction(t *testing.T) {
 				t.Fatalf("truncate size = %v", op.Size)
 			}
 		}},
-		{name: "chmod", action: "chmod", args: []string{"--mode", "640", "source"}},
-		{name: "chown", action: "chown", args: []string{"--uid", "0", "source"}},
+		{name: "chmod", action: "chmod", args: []string{"--mode", "640", "source"}, unsupportedWindows: true},
+		{name: "chown", action: "chown", args: []string{"--uid", "0", "source"}, unsupportedWindows: true},
 		{name: "archive", action: "archive", args: []string{"--archive-format", "tar.gz", "directory", "data.tgz"}},
 		{name: "extract", action: "extract", args: []string{"--archive-format", "tar", "source.tar", "out"}},
 	}
@@ -97,6 +98,13 @@ func TestPlanCommandCoversEveryAction(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			args := []string{"plan", "--root", root, tt.action}
 			args = append(args, tt.args...)
+			if runtime.GOOS == windowsOS && tt.unsupportedWindows {
+				err := executeOperationCLIError(t, args...)
+				if err == nil || !strings.Contains(err.Error(), "unsupported on windows") {
+					t.Fatalf("error = %v, want unsupported-on-windows rejection", err)
+				}
+				return
+			}
 			plan := readCLIPlan(t, executeOperationCLI(t, nil, args...))
 			if len(plan.Operations) != 1 || plan.Operations[0].Action != fsops.Action(tt.action) {
 				t.Fatalf("plan = %#v", plan)
@@ -110,13 +118,18 @@ func TestPlanCommandCoversEveryAction(t *testing.T) {
 
 func TestPlanCommandRecordsDestinationAbsenceAndIdentity(t *testing.T) {
 	root := t.TempDir()
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
 	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	canonicalDestination := filepath.Join(canonicalRoot, "destination")
 	absentPlan := readCLIPlan(t, executeOperationCLI(t, nil, "plan", "--root", root, "copy", "source", "destination"))
 	absent := absentPlan.Operations[0].ExpectedDestination
-	if absent == nil || absent.Exists || absent.Entry != nil || absent.Path != destination {
+	if absent == nil || absent.Exists || absent.Entry != nil || !sameTestPath(absent.Path, canonicalDestination) {
 		t.Fatalf("absent destination guard = %#v", absent)
 	}
 	if err := os.WriteFile(destination, []byte("old"), 0o600); err != nil {
@@ -124,7 +137,7 @@ func TestPlanCommandRecordsDestinationAbsenceAndIdentity(t *testing.T) {
 	}
 	presentPlan := readCLIPlan(t, executeOperationCLI(t, nil, "plan", "--root", root, "copy", "source", "destination"))
 	present := presentPlan.Operations[0].ExpectedDestination
-	if present == nil || !present.Exists || present.Entry == nil || present.Entry.Path != destination || present.Entry.Size != 3 {
+	if present == nil || !present.Exists || present.Entry == nil || !sameTestPath(present.Entry.Path, canonicalDestination) || present.Entry.Size != 3 {
 		t.Fatalf("present destination guard = %#v", present)
 	}
 }
@@ -365,6 +378,22 @@ func executeOperationCLI(t *testing.T, in io.Reader, args ...string) string {
 		t.Fatalf("dirstat %v: %v", args, err)
 	}
 	return out.String()
+}
+
+func executeOperationCLIError(t *testing.T, args ...string) error {
+	t.Helper()
+	cmd := New()
+	cmd.SetArgs(args)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	return cmd.Execute()
+}
+
+func sameTestPath(left, right string) bool {
+	if runtime.GOOS == windowsOS {
+		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 func readCLIPlan(t *testing.T, data string) fsops.Plan {

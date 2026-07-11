@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -40,8 +41,10 @@ func TestDirectoryCopyPublishesCompleteSiblingStage(t *testing.T) {
 		t.Fatalf("results = %#v", results)
 	}
 	assertTestFile(t, filepath.Join(destination, "nested", "payload"), "complete")
-	if info, statErr := os.Stat(destination); statErr != nil || info.Mode().Perm() != 0o550 {
-		t.Fatalf("destination mode: info=%v error=%v", info, statErr)
+	if runtime.GOOS != windowsOS {
+		if info, statErr := os.Stat(destination); statErr != nil || info.Mode().Perm() != 0o550 {
+			t.Fatalf("destination mode: info=%v error=%v", info, statErr)
+		}
 	}
 	assertNoStagingArtifacts(t, root)
 }
@@ -49,9 +52,10 @@ func TestDirectoryCopyPublishesCompleteSiblingStage(t *testing.T) {
 func TestDirectoryCopyFailureAndCancellationNeverExposeDestination(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name      string
-		configure func(*mutationFilesystem, context.CancelFunc)
-		want      string
+		name          string
+		skipOnWindows bool
+		configure     func(*mutationFilesystem, context.CancelFunc)
+		want          string
 	}{
 		{
 			name: "child copy failure",
@@ -88,7 +92,8 @@ func TestDirectoryCopyFailureAndCancellationNeverExposeDestination(t *testing.T)
 			want: "injected publish failure",
 		},
 		{
-			name: "staging directory sync failure",
+			name:          "staging directory sync failure",
+			skipOnWindows: true,
 			configure: func(filesystem *mutationFilesystem, _ context.CancelFunc) {
 				syncFile := filesystem.sync
 				filesystem.sync = func(file *os.File) error {
@@ -108,6 +113,9 @@ func TestDirectoryCopyFailureAndCancellationNeverExposeDestination(t *testing.T)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
+			if runtime.GOOS == windowsOS && test.skipOnWindows {
+				t.Skip("Windows publication does not expose directory fsync")
+			}
 			root := t.TempDir()
 			source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
 			if err := os.Mkdir(source, 0o700); err != nil {

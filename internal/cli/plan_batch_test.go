@@ -18,6 +18,10 @@ import (
 func TestPlanRepeatedSourcesAreGuardedOrderedDeduplicatedAndSummarized(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"a", "b"} {
 		if err := os.WriteFile(filepath.Join(root, name), bytes.Repeat([]byte(name), 4096), 0o600); err != nil {
 			t.Fatal(err)
@@ -35,7 +39,7 @@ func TestPlanRepeatedSourcesAreGuardedOrderedDeduplicatedAndSummarized(t *testin
 	}
 	for index, name := range []string{"a", "b"} {
 		operation := plan.Operations[index]
-		if operation.ID != fmt.Sprintf("delete-%d", index+1) || operation.Source != filepath.Join(root, name) || operation.Expected == nil {
+		if operation.ID != fmt.Sprintf("delete-%d", index+1) || !sameTestPath(operation.Source, filepath.Join(canonicalRoot, name)) || operation.Expected == nil {
 			t.Fatalf("operation %d = %#v", index, operation)
 		}
 	}
@@ -167,6 +171,10 @@ func TestPlanMixedJSONLDependencyRoundTripDryRunAndApply(t *testing.T) {
 func TestPlanBatchCopyMapsBasenamesAndCapturesDestinationGuards(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, directory := range []string{"left", "right", "destination"} {
 		if err := os.Mkdir(filepath.Join(root, directory), 0o700); err != nil {
 			t.Fatal(err)
@@ -178,6 +186,7 @@ func TestPlanBatchCopyMapsBasenamesAndCapturesDestinationGuards(t *testing.T) {
 		}
 	}
 	existingDestination := filepath.Join(root, "destination", "two")
+	canonicalExistingDestination := filepath.Join(canonicalRoot, "destination", "two")
 	if err := os.WriteFile(existingDestination, []byte("reviewed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -193,11 +202,14 @@ func TestPlanBatchCopyMapsBasenamesAndCapturesDestinationGuards(t *testing.T) {
 		t.Fatalf("operations = %#v", plan.Operations)
 	}
 	first, second := plan.Operations[0], plan.Operations[1]
-	if first.Destination != filepath.Join(root, "destination", "one") || first.ExpectedDestination == nil || first.ExpectedDestination.Exists {
+	if !sameTestPath(first.Destination, filepath.Join(canonicalRoot, "destination", "one")) || first.ExpectedDestination == nil || first.ExpectedDestination.Exists || !sameTestPath(first.ExpectedDestination.Path, filepath.Join(canonicalRoot, "destination", "one")) {
 		t.Fatalf("first destination guard = %#v", first)
 	}
-	if second.Destination != existingDestination || second.ExpectedDestination == nil || !second.ExpectedDestination.Exists || second.ExpectedDestination.Entry == nil {
+	if !sameTestPath(second.Destination, canonicalExistingDestination) || second.ExpectedDestination == nil || !second.ExpectedDestination.Exists || second.ExpectedDestination.Entry == nil {
 		t.Fatalf("second destination guard = %#v", second)
+	}
+	if !sameTestPath(second.ExpectedDestination.Path, canonicalExistingDestination) || !sameTestPath(second.ExpectedDestination.Entry.Path, canonicalExistingDestination) {
+		t.Fatalf("second destination paths = %#v", second.ExpectedDestination)
 	}
 	if first.Expected == nil || second.Expected == nil {
 		t.Fatalf("source guards missing: %#v", plan.Operations)
@@ -221,7 +233,7 @@ func TestPlanRecursiveDeleteDeduplicatesDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := readCLIPlan(t, out)
-	if len(plan.Operations) != 1 || plan.Operations[0].Source != parent || !plan.Operations[0].Recursive {
+	if len(plan.Operations) != 1 || !sameTestPath(plan.Operations[0].Source, parent) || !plan.Operations[0].Recursive {
 		t.Fatalf("plan = %#v", plan)
 	}
 }

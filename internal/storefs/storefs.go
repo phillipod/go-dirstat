@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	lockName   = ".dirstat.lock"
-	markerName = ".dirstat-store"
+	lockName           = ".dirstat.lock"
+	markerName         = ".dirstat-store"
+	markerMissingIssue = "store marker is missing"
 )
 
 // Root is a stable directory-handle capability. All entry operations are
@@ -264,7 +265,7 @@ func (r *Root) Ownership(kind string) (bool, string) {
 func (r *Root) markerOwnership(kind string) (bool, string) {
 	data, _, err := r.ReadRegular(markerName, 256)
 	if errors.Is(err, fs.ErrNotExist) {
-		return false, "store marker is missing"
+		return false, markerMissingIssue
 	}
 	if err != nil {
 		return false, err.Error()
@@ -304,7 +305,7 @@ func (r *Root) EnsureOwnershipContext(ctx context.Context, kind string, adopt bo
 		}
 		return nil
 	}
-	if markerIssue != "store marker is missing" {
+	if markerIssue != markerMissingIssue {
 		return errors.New(markerIssue)
 	}
 	if !adopt && !privateStore(r.path, r.info) {
@@ -343,6 +344,53 @@ func (r *Root) EnsureOwnershipContext(ctx context.Context, kind string, adopt bo
 		}
 	}
 	return err
+}
+
+// EnsureOwnershipForNewStoreContext creates the ownership marker for a newly
+// initialized store. In addition to the strict EnsureOwnershipContext
+// contract, this path may tighten an empty directory that is already owned by
+// the current user. This is useful for callers that receive a pre-created
+// temporary/cache directory whose mode or ACL was selected by the host (for
+// example, a hosted CI runner). It never repairs a non-empty or foreign
+// directory, and it does not alter an existing marked store; callers must use
+// explicit migration for those cases.
+func (r *Root) EnsureOwnershipForNewStoreContext(ctx context.Context, kind string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	markerOwned, markerIssue := r.markerOwnership(kind)
+	if markerOwned || markerIssue != markerMissingIssue {
+		return r.EnsureOwnershipContext(ctx, kind, false)
+	}
+	if privateStore(r.path, r.info) {
+		return r.EnsureOwnershipContext(ctx, kind, false)
+	}
+	if !ownedByCurrentUser(r.path, r.info) {
+		return r.EnsureOwnershipContext(ctx, kind, false)
+	}
+	entries, err := r.ReadDir()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() != lockName {
+			return r.EnsureOwnershipContext(ctx, kind, false)
+		}
+	}
+	if err := makePrivateStore(r.path, func(mode fs.FileMode) error { return r.handle.Chmod(".", mode) }); err != nil {
+		return err
+	}
+	if err := r.refreshInfo(); err != nil {
+		return err
+	}
+	if !privateStore(r.path, r.info) {
+		return fmt.Errorf("store directory %q could not be made private", r.path)
+	}
+	return r.EnsureOwnershipContext(ctx, kind, false)
 }
 
 func (r *Root) refreshInfo() error {

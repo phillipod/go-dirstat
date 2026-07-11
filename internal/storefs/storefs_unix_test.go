@@ -125,6 +125,32 @@ func TestOwnershipRequiresPrivateCurrentUserDirectory(t *testing.T) {
 	}
 }
 
+func TestNewStoreInitializationTightensEmptyOwnedDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	if err := root.EnsureOwnershipForNewStoreContext(context.Background(), "index"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("initialized directory mode = %04o, want 0700", got)
+	}
+	if owned, issue := root.Ownership("index"); !owned || issue != "" {
+		t.Fatalf("initialized ownership = %v, %q", owned, issue)
+	}
+}
+
 func TestPrivateStoreChecksModeAndEffectiveOwner(t *testing.T) {
 	uid := uint32(os.Geteuid())
 	private := fakeFileInfo{mode: fs.ModeDir | 0o700, sys: &syscall.Stat_t{Uid: uid}}
