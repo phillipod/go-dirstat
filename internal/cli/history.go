@@ -247,16 +247,17 @@ func historyKey(cfg *Config, path, storeDir string) (string, scope.Policy, strin
 	if err != nil {
 		return "", scope.Policy{}, "", false, err
 	}
-	// Persist and fingerprint the resolved root so aliases such as macOS
-	// /var -> /private/var cannot split otherwise identical history keys or
-	// make the scanner's canonical exclusion paths miss the stored state. On
-	// Windows, EvalSymlinks may alternate between short and long spellings on
-	// profile paths; retain the stable absolute spelling supplied by the
-	// caller while still using resolved paths for containment and exclusions.
+	// Keep the user-visible absolute root in records and delta paths, but use a
+	// resolved identity for the fingerprint where aliases are known to exist.
+	// macOS /var -> /private/var otherwise splits otherwise identical history
+	// keys. On Windows, EvalSymlinks may alternate between short and long
+	// spellings on profile paths, so the stable absolute spelling is used for
+	// both display and fingerprint while resolved paths still drive exclusions.
+	fingerprintRoot := root
 	if runtime.GOOS != windowsOS {
-		root = rootResolved
+		fingerprintRoot = rootResolved
 	}
-	return root, policy, index.Fingerprint(root, policy), contained, nil
+	return visibleRoot, policy, index.Fingerprint(fingerprintRoot, policy), contained, nil
 }
 
 func resolvedPath(path string) string {

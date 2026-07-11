@@ -85,7 +85,7 @@ func TestStateStatusListAndSizeDescribeIndexAndHistory(t *testing.T) {
 		t.Fatalf("state list entries = %#v", entries)
 	}
 	for _, entry := range entries {
-		if !entry.Valid || !entry.Safe || !entry.Complete || entry.Root != root || entry.SizeBytes <= 0 {
+		if !entry.Valid || !entry.Safe || !entry.Complete || !sameTestPath(entry.Root, root) || entry.SizeBytes <= 0 {
 			t.Errorf("state list entry = %#v", entry)
 		}
 	}
