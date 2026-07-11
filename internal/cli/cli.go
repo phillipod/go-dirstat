@@ -231,11 +231,11 @@ func (c *Config) textOptions(out io.Writer) render.TextOptions {
 	}
 }
 
-// writerIsTTY reports whether the actual output destination is a terminal.
-// Cobra callers may replace stdout with a buffer or pipe, so consulting the
-// process-global os.Stdout would leak ANSI into redirected command output.
-func writerIsTTY(out io.Writer) bool {
-	f, ok := out.(*os.File)
+// writerIsTTY reports whether the supplied command stream is a terminal.
+// Cobra callers may replace standard streams with buffers or pipes, so
+// consulting process-global standard streams would leak interactive behavior.
+func writerIsTTY(stream any) bool {
+	f, ok := stream.(*os.File)
 	if !ok {
 		return false
 	}

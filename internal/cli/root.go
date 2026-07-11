@@ -48,6 +48,7 @@ revalidate source metadata, and run only with the caller's privileges.`,
 	root.AddCommand(newHistoryCommand(cfg))
 	root.AddCommand(newPlanCommand())
 	root.AddCommand(newApplyCommand())
+	root.AddCommand(newSkillsCommand())
 	root.AddCommand(newVersionCmd())
 	return root
 }

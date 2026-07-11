@@ -21,6 +21,7 @@ class_inference:
   internal/scan: domain
   internal/agg: domain
   internal/index: domain
+  internal/skills: domain
   internal/config: foundation
   internal/fsinfo: foundation
   internal/scope: foundation
@@ -42,6 +43,7 @@ ownership_inference:
   internal/scan: engine
   internal/agg: engine
   internal/index: engine
+  internal/skills: engine
   internal/config: infra
   internal/fsinfo: infra
   internal/scope: infra

@@ -269,6 +269,52 @@ escapes. They are not a sandbox against another process that can rename paths
 inside the root while a plan is running. Restrict writes or work from a private
 snapshot when the tree is not trusted.
 
+## Agent skills
+
+`dirstat skills` installs portable Agent Skills definitions for Codex and
+Claude. The default target is the user's skills directory; use
+`--scope=project --project-dir .` for a repository-local installation, or
+`--codex-path` / `--claude-path` for an exact `SKILL.md` destination.
+
+```bash
+# Print a definition for an agent without changing any files.
+dirstat skills view
+
+# Install the read-only analysis skill for both Codex and Claude.
+dirstat skills install
+
+# Add the plan-and-dry-run operator skill alongside it.
+dirstat skills install --profile=operator
+
+# Print the non-authorizing template. Add built-in guarded-cleanup safeguards if useful.
+dirstat skills rules template
+dirstat skills rules template --guarded-cleanup
+
+# Install an administrator skill whose permitted actions are copied from policy.md.
+dirstat skills install --profile=administrator --rules-file policy.md
+
+# In a terminal, this asks whether to open the same template in tools.editor.
+dirstat skills install --profile=administrator
+
+# Check or remove installed definitions. Changed files need --force.
+dirstat skills status --profile=all
+dirstat skills remove --profile=operator
+```
+
+The profiles are deliberately separate: `dirstat` only investigates and
+proposes cleanup; `dirstat-operator` may create guarded plans and dry-run them
+but still needs authorization to mutate files; `dirstat-administrator` may act
+only within the policy embedded when it was installed. Administrator policies
+are supplied with repeatable `--rule` flags or `--rules-file`, copied into the
+skill, and required every time that profile is installed or updated. When an
+administrator install has no policy and both input and output are terminals,
+`dirstat` asks whether to open the template with the exact `tools.editor` argv
+configured in `config.json`, then whether to include the built-in guarded
+cleanup safeguards (plan, dry-run, audit, and symlink protection). The template
+grants no authority until edited; unchanged templates are rejected. Scripts
+should supply `--rule` or `--rules-file`; `--edit-rules` explicitly requests
+the terminal editor.
+
 ## TUI
 
 `dirstat tui [path]` opens a full-screen browser.
@@ -380,6 +426,7 @@ internal/preview       presentation — size-limited text/hex previews
 internal/scan          domain      — concurrent scanner, builds the tree
 internal/agg           domain      — extension/top-file breakdowns
 internal/index         domain      — snapshot, scope fingerprint, and disk store
+internal/skills        domain      — portable agent skill definitions and guarded installation
 internal/query         domain      — flat filtering, sorting, JSONL/TSV/NUL
 internal/history       domain      — retained snapshots and growth deltas
 internal/diagnose      domain      — volume and platform pressure evidence
