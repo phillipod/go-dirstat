@@ -818,7 +818,7 @@ func (s *scanner) runStatTask(task statTask) {
 	}
 	info, err := s.statEntry(task.parent, task.entry)
 	resolved := ""
-	if err == nil && s.opts.Policy.FollowSymlinks && task.entry.Type()&fs.ModeSymlink != 0 {
+	if err == nil && s.opts.Policy.FollowSymlinks && followedAliasEntry(task.entry) {
 		resolved, _ = filepath.EvalSymlinks(filepath.Join(task.parent, task.entry.Name()))
 	}
 	if s.ctx.Err() != nil {
@@ -829,13 +829,28 @@ func (s *scanner) runStatTask(task statTask) {
 	}
 }
 
-// statEntry stats a single entry, following symlinks when configured.
+// statEntry stats a single entry, following symlinks when configured. Windows
+// represents directory junctions as irregular reparse points rather than
+// ModeSymlink entries, so followedAliasEntry also recognizes that shape. If we
+// only call os.Stat for ModeSymlink, a junction is returned as a non-directory
+// leaf and a loop alias leaks into the rendered tree instead of being claimed
+// by the existing directory identity graph.
 func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, error) {
 	p := filepath.Join(parent, e.Name())
-	if s.opts.Policy.FollowSymlinks && e.Type()&fs.ModeSymlink != 0 {
+	if s.opts.Policy.FollowSymlinks && followedAliasEntry(e) {
 		return os.Stat(p) // follow
 	}
 	return e.Info()
+}
+
+func followedAliasEntry(e os.DirEntry) bool {
+	typ := e.Type()
+	if typ&fs.ModeSymlink != 0 {
+		return true
+	}
+	// Go exposes Windows mount-point junctions as ModeIrregular because their
+	// reparse tag is a name surrogate but not an ordinary symbolic link.
+	return runtime.GOOS == windowsOS && typ&fs.ModeIrregular != 0
 }
 
 // registerRootDirectory seeds the followed-directory graph before traversal.
