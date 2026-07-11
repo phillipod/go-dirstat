@@ -49,6 +49,61 @@ func TestDirectoryCopyPublishesCompleteSiblingStage(t *testing.T) {
 	assertNoStagingArtifacts(t, root)
 }
 
+func TestDirectoryCopyRestoreModeDoesNotFollowReplacedDestinationSymlink(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == windowsOS {
+		t.Skip("symlink chmod race is Unix-specific")
+	}
+	root := t.TempDir()
+	t.Cleanup(func() { makeTreeRemovable(root) })
+	source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
+	victim := filepath.Join(root, "victim-file")
+	replacedDestination := filepath.Join(root, "published-directory")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(source, "payload"), "complete")
+	writeTestFile(t, victim, "sensitive")
+	if err := os.Chmod(source, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(victim, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := defaultMutationFilesystem()
+	publish := filesystem.publish
+	filesystem.publish = func(oldPath, newPath string) error {
+		if err := publish(oldPath, newPath); err != nil {
+			return err
+		}
+		if newPath != destination {
+			return nil
+		}
+		if err := os.Rename(newPath, replacedDestination); err != nil {
+			return err
+		}
+		return os.Symlink(victim, newPath)
+	}
+
+	if err := copyDirectoryStaged(context.Background(), source, destination, filesystem); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("destination was not replaced with symlink: %s", info.Mode())
+	}
+	if victimInfo, err := os.Stat(victim); err != nil || victimInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("victim mode changed through replacement symlink: info=%v error=%v", victimInfo, err)
+	}
+	if publishedInfo, err := os.Stat(replacedDestination); err != nil || publishedInfo.Mode().Perm() != 0o777 {
+		t.Fatalf("published directory mode not restored through descriptor: info=%v error=%v", publishedInfo, err)
+	}
+}
+
 func TestDirectoryCopyFailureAndCancellationNeverExposeDestination(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

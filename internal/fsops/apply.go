@@ -1048,6 +1048,15 @@ type sourceSnapshot struct {
 	entries []sourceSnapshotEntry
 }
 
+func snapshotRootMode(snapshot sourceSnapshot) (os.FileMode, error) {
+	for _, entry := range snapshot.entries {
+		if entry.relative == "." {
+			return os.FileMode(entry.entry.Mode).Perm(), nil
+		}
+	}
+	return 0, errors.New("source snapshot missing root entry")
+}
+
 func captureSourceSnapshot(ctx context.Context, source string) (sourceSnapshot, error) {
 	snapshot := sourceSnapshot{}
 	err := filepath.WalkDir(source, func(path string, _ fs.DirEntry, walkErr error) error {
@@ -1241,6 +1250,15 @@ func copyDirectoryStaged(
 			returnErr = partialMutation(errors.Join(returnErr, wrapped))
 		}
 	}()
+	stageRoot, err := openDirectoryModeHandle(stage)
+	if err != nil {
+		return fmt.Errorf("open directory copy staging root: %w", err)
+	}
+	defer func() {
+		if closeErr := filesystem.close(stageRoot); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close directory copy staging root: %w", closeErr))
+		}
+	}()
 	if err := copyDirectoryIntoExisting(ctx, src, stage, filesystem); err != nil {
 		return fmt.Errorf("build directory copy staging area: %w", err)
 	}
@@ -1255,21 +1273,22 @@ func copyDirectoryStaged(
 	}
 	// Some native filesystems (notably macOS volumes) require the source
 	// directory being renamed to remain owner-writable even when the final
-	// destination is intentionally read-only. Make the private stage renameable
-	// first, publish it atomically, then restore the reviewed root mode.
-	sourceInfo, err := os.Lstat(src)
+	// destination is intentionally read-only. Derive the final mode from the
+	// verified source snapshot, make the private stage renameable, publish it,
+	// then restore the mode through the open staging handle so a path
+	// replacement after publication cannot redirect chmod to another object.
+	finalMode, err := snapshotRootMode(snapshot)
 	if err != nil {
 		return err
 	}
-	finalMode := sourceInfo.Mode().Perm()
-	if err := os.Chmod(stage, finalMode|0o200); err != nil {
+	if err := stageRoot.Chmod(finalMode | 0o200); err != nil {
 		return fmt.Errorf("prepare directory copy publication: %w", err)
 	}
 	if err := filesystem.publish(stage, dst); err != nil {
 		return fmt.Errorf("publish directory copy: %w", err)
 	}
 	published = true
-	if err := os.Chmod(dst, finalMode); err != nil {
+	if err := stageRoot.Chmod(finalMode); err != nil {
 		return publishedMutation(fmt.Errorf("directory copy published but destination mode could not be restored: %w", err))
 	}
 	if err := syncDirectory(filepath.Dir(dst), filesystem); err != nil {
