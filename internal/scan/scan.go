@@ -114,7 +114,7 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 		return nil, Stats{}, err
 	}
 	rootFSPath := rootAbs
-	if opts.Policy.FollowSymlinks && info.Mode()&fs.ModeSymlink != 0 {
+	if opts.Policy.FollowSymlinks && followedAliasMode(info.Mode()) {
 		info, err = os.Stat(rootAbs)
 		if err != nil {
 			return nil, Stats{}, err
@@ -818,7 +818,7 @@ func (s *scanner) runStatTask(task statTask) {
 	}
 	info, err := s.statEntry(task.parent, task.entry)
 	resolved := ""
-	if err == nil && s.opts.Policy.FollowSymlinks && followedAliasEntry(task.entry) {
+	if err == nil && s.opts.Policy.FollowSymlinks && (runtime.GOOS == windowsOS || followedAliasEntry(task.entry)) {
 		resolved, _ = filepath.EvalSymlinks(filepath.Join(task.parent, task.entry.Name()))
 	}
 	if s.ctx.Err() != nil {
@@ -830,21 +830,25 @@ func (s *scanner) runStatTask(task statTask) {
 }
 
 // statEntry stats a single entry, following symlinks when configured. Windows
-// represents directory junctions as irregular reparse points rather than
-// ModeSymlink entries, so followedAliasEntry also recognizes that shape. If we
-// only call os.Stat for ModeSymlink, a junction is returned as a non-directory
-// leaf and a loop alias leaks into the rendered tree instead of being claimed
-// by the existing directory identity graph.
+// represents directory junctions as reparse points rather than ordinary
+// ModeSymlink entries, and some directory APIs omit that type bit entirely. A
+// follow-enabled Windows scan therefore asks os.Stat for every entry so a
+// junction is classified from its target and can be claimed by the existing
+// directory identity graph instead of leaking as a file leaf.
 func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, error) {
 	p := filepath.Join(parent, e.Name())
-	if s.opts.Policy.FollowSymlinks && followedAliasEntry(e) {
+	if s.opts.Policy.FollowSymlinks && (runtime.GOOS == windowsOS || followedAliasEntry(e)) {
 		return os.Stat(p) // follow
 	}
 	return e.Info()
 }
 
 func followedAliasEntry(e os.DirEntry) bool {
-	typ := e.Type()
+	return followedAliasMode(e.Type())
+}
+
+func followedAliasMode(mode fs.FileMode) bool {
+	typ := mode
 	if typ&fs.ModeSymlink != 0 {
 		return true
 	}
