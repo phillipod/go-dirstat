@@ -87,7 +87,7 @@ func TestStoreCacheKeyCannotEscapeDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := store.pathFor(snap.Root, snap.Fingerprint)
-	if filepath.Dir(path) != dir {
+	if filepath.Dir(path) != store.Dir() {
 		t.Fatalf("cache path escaped store: %q", path)
 	}
 	if _, err := os.Stat(path); err != nil {

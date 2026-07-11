@@ -227,7 +227,11 @@ func TestNewStoreUsesDurableStateDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(state, "dirstat", "history")
+	canonicalState, err := filepath.EvalSymlinks(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(canonicalState, "dirstat", "history")
 	if store.Dir() != want {
 		t.Fatalf("store directory = %q, want %q", store.Dir(), want)
 	}

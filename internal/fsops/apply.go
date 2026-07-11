@@ -819,10 +819,22 @@ func within(root, path string) bool {
 }
 
 func samePath(a, b string) bool {
-	if runtime.GOOS == windowsOS {
-		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "darwin" {
+		// macOS exposes /var as a symlink to /private/var. Normalize existing
+		// ancestors so guards and injected publication seams compare the same
+		// object even when callers use the conventional alias.
+		if resolved, err := canonicalNoFollowPath(a); err == nil {
+			a = resolved
+		}
+		if resolved, err := canonicalNoFollowPath(b); err == nil {
+			b = resolved
+		}
 	}
-	return filepath.Clean(a) == filepath.Clean(b)
+	if runtime.GOOS == windowsOS {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 func destinationReady(dst string, policy ConflictPolicy) error {

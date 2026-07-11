@@ -75,6 +75,9 @@ type Action struct {
 
 // DefaultStoreDir returns the cache location without creating it.
 func DefaultStoreDir() (string, error) {
+	if base := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); base != "" {
+		return filepath.Join(base, "dirstat"), nil
+	}
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err

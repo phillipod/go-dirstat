@@ -23,8 +23,23 @@ func ownedByCurrentUser(path string, _ fs.FileInfo) bool {
 	if err != nil || owner == nil {
 		return false
 	}
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
-	return err == nil && user != nil && user.User.Sid != nil && windows.EqualSid(owner, user.User.Sid)
+	token := windows.GetCurrentProcessToken()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil {
+		return false
+	}
+	if windows.EqualSid(owner, user.User.Sid) {
+		return true
+	}
+	// Windows commonly reports BUILTIN\\Administrators as the owner of runner
+	// and service-created directories. Treat that owner as current-user-owned
+	// only when the effective token is actually a member of the group; the
+	// private DACL check still rejects untrusted write/delete grants.
+	if !owner.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
+		return false
+	}
+	member, err := token.IsMember(owner)
+	return err == nil && member
 }
 
 func privateStore(path string, info fs.FileInfo) bool {

@@ -560,6 +560,9 @@ func makeOwnedIndexStore(t *testing.T, dir string) {
 
 func singleMatchingFile(t *testing.T, root, pattern string) string {
 	t.Helper()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	matches, err := filepath.Glob(filepath.Join(root, pattern))
 	if err != nil {
 		t.Fatal(err)

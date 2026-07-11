@@ -82,7 +82,7 @@ func TestPlanFiles0FromPreservesHostileNames(t *testing.T) {
 		t.Fatalf("operations = %#v", plan.Operations)
 	}
 	for index, name := range names {
-		if plan.Operations[index].Source != filepath.Join(root, name) {
+		if !sameTestPath(plan.Operations[index].Source, filepath.Join(root, name)) {
 			t.Fatalf("source %d = %q", index, plan.Operations[index].Source)
 		}
 	}

@@ -390,10 +390,31 @@ func executeOperationCLIError(t *testing.T, args ...string) error {
 }
 
 func sameTestPath(left, right string) bool {
-	if runtime.GOOS == windowsOS {
-		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	left, right = filepath.Clean(left), filepath.Clean(right)
+	if runtime.GOOS == "darwin" {
+		if resolved, err := canonicalTestPath(left); err == nil {
+			left = resolved
+		}
+		if resolved, err := canonicalTestPath(right); err == nil {
+			right = resolved
+		}
 	}
-	return filepath.Clean(left) == filepath.Clean(right)
+	if runtime.GOOS == windowsOS {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func canonicalTestPath(path string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(abs)), nil
 }
 
 func readCLIPlan(t *testing.T, data string) fsops.Plan {

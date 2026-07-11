@@ -208,15 +208,16 @@ func historyKey(cfg *Config, path, storeDir string) (string, scope.Policy, strin
 	if err != nil {
 		return "", scope.Policy{}, "", false, err
 	}
+	visibleRoot := root
 	store, err := absolutePath(storeDir)
 	if err != nil {
 		return "", scope.Policy{}, "", false, fmt.Errorf("resolve history store: %w", err)
 	}
 	rootResolved := resolvedPath(root)
 	storeResolved := resolvedPath(store)
-	visibleStoreUnderRoot, visibleRelative := pathContainedBy(root, store)
+	visibleStoreUnderRoot, visibleRelative := pathContainedBy(visibleRoot, store)
 	resolvedStoreUnderRoot, resolvedRelative := pathContainedBy(rootResolved, storeResolved)
-	visibleRootUnderStore, _ := pathContainedBy(store, root)
+	visibleRootUnderStore, _ := pathContainedBy(store, visibleRoot)
 	resolvedRootUnderStore, _ := pathContainedBy(storeResolved, rootResolved)
 	if (visibleStoreUnderRoot && visibleRelative == ".") ||
 		(resolvedStoreUnderRoot && resolvedRelative == ".") ||
@@ -245,6 +246,10 @@ func historyKey(cfg *Config, path, storeDir string) (string, scope.Policy, strin
 	if err != nil {
 		return "", scope.Policy{}, "", false, err
 	}
+	// Persist and fingerprint the resolved root so aliases such as macOS
+	// /var -> /private/var cannot split otherwise identical history keys or
+	// make the scanner's canonical exclusion paths miss the stored state.
+	root = rootResolved
 	return root, policy, index.Fingerprint(root, policy), contained, nil
 }
 
