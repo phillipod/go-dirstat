@@ -215,13 +215,18 @@ func (p *Policy) isVirtual(abs string) bool {
 		if pathWithin(vp, abs) {
 			return true
 		}
+		// macOS exposes /var as /private/var. Resolve only that known alias
+		// case; ordinary virtual-path checks remain purely lexical.
+		if runtime.GOOS == "darwin" && isMacVarPath(vp) && isMacVarPath(abs) && pathWithinCanonical(vp, abs) {
+			return true
+		}
 	}
 	return false
 }
 
 func (p *Policy) excludedPath(abs string) bool {
 	for _, ep := range p.ExcludePaths {
-		if pathWithin(ep, abs) {
+		if pathWithinCanonical(ep, abs) {
 			return true
 		}
 	}
@@ -249,11 +254,15 @@ func (p *Policy) includedPath(abs string) bool {
 func pathWithin(parent, child string) bool {
 	parent = filepath.Clean(parent)
 	child = filepath.Clean(child)
+	return pathWithinClean(parent, child)
+}
+
+func pathWithinCanonical(parent, child string) bool {
+	parent = filepath.Clean(parent)
+	child = filepath.Clean(child)
 	if pathWithinClean(parent, child) {
 		return true
 	}
-	// Most entries match lexically. Only pay for filesystem alias resolution
-	// when that fast path fails (for example /var vs /private/var on macOS).
 	return pathWithinClean(canonicalComparePath(parent), canonicalComparePath(child))
 }
 
@@ -299,6 +308,12 @@ func canonicalComparePath(path string) string {
 		path = strings.ToLower(path)
 	}
 	return path
+}
+
+func isMacVarPath(path string) bool {
+	path = filepath.ToSlash(filepath.Clean(path))
+	return path == "/var" || strings.HasPrefix(path, "/var/") ||
+		path == "/private/var" || strings.HasPrefix(path, "/private/var/")
 }
 
 func isHidden(name string) bool {
