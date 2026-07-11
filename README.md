@@ -1,5 +1,8 @@
 # dirstat
 
+[![CI](https://github.com/phillipod/go-dirstat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/phillipod/go-dirstat/actions/workflows/ci.yml)
+[![Coverage](https://github.com/phillipod/go-dirstat/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/phillipod/go-dirstat/actions/workflows/coverage.yml)
+
 Read-only terminal disk-usage exploration for people and shell pipelines.
 
 `dirstat` measures directory trees and reports size, file counts, and
@@ -43,6 +46,28 @@ Or directly:
 
 ```bash
 go install ./cmd/dirstat
+```
+
+## Automation and releases
+
+The repository uses GitHub-hosted public runners exclusively:
+
+- **CI** runs on every pull request and `main` push across Linux, macOS, and
+  Windows, with tests, vet, the race detector, and golangci-lint.
+- **Coverage** runs on pull requests, `main`, and a nightly schedule under the
+  minimum supported Go line and the current stable Go release. Reports are
+  retained as workflow artifacts with an 80% statement-coverage floor.
+- **Nightly integration** runs shuffled tests and real CLI smoke tests across
+  Linux, macOS, and Windows, including followed-symlink loop protection where
+  the runner supports symlinks.
+- **Releases** are published by pushing a semver tag such as `v1.2.3`.
+  The release workflow verifies the tag, tests the source, and publishes
+  archives for `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`,
+  `windows-amd64`, and `windows-arm64`, together with `SHA256SUMS`.
+
+```bash
+git tag -a v1.2.3 -m 'release v1.2.3'
+git push origin v1.2.3
 ```
 
 ## Quick start

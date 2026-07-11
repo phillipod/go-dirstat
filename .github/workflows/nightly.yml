@@ -1,0 +1,106 @@
+name: Nightly integration
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cli-integration:
+    name: CLI integration / ${{ matrix.os }} / Go ${{ matrix.go-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go-version: '1.24.x'
+            exe: ''
+            symlinks: true
+          - os: ubuntu-latest
+            go-version: stable
+            exe: ''
+            symlinks: true
+          - os: macos-latest
+            go-version: '1.24.x'
+            exe: ''
+            symlinks: true
+          - os: windows-latest
+            go-version: '1.24.x'
+            exe: .exe
+            symlinks: false
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Run shuffled package tests
+        run: go test -shuffle=on ./... -count=1
+
+      - name: Build CLI
+        shell: bash
+        env:
+          DIRSTAT: ./dirstat${{ matrix.exe }}
+        run: go build -trimpath -o "$DIRSTAT" ./cmd/dirstat
+
+      - name: Exercise CLI integration surface
+        shell: bash
+        env:
+          DIRSTAT: ./dirstat${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          fixture="$(mktemp -d)"
+          trap 'rm -rf "$fixture"' EXIT
+          mkdir -p "$fixture/sub"
+          printf 'alpha\n' > "$fixture/alpha.txt"
+          printf 'beta payload\n' > "$fixture/sub/payload.bin"
+
+          "$DIRSTAT" --apparent --format=tsv --bytes --files "$fixture" > "$fixture/tree.tsv"
+          awk -F '\t' 'NF != 2 || $1 !~ /^[0-9]+$/ { exit 1 } END { if (NR < 4) exit 1 }' "$fixture/tree.tsv"
+
+          "$DIRSTAT" extensions --apparent --bytes --no-color --no-bar "$fixture" > "$fixture/extensions.txt"
+          grep -q '^By extension$' "$fixture/extensions.txt"
+          grep -q '^Largest files$' "$fixture/extensions.txt"
+
+          if [[ "${{ matrix.symlinks }}" == "true" ]]; then
+            ln -s "$fixture" "$fixture/sub/root-loop"
+            "$DIRSTAT" --follow --apparent --format=tsv --bytes --files "$fixture" > "$fixture/follow.tsv"
+            if grep -Fq 'root-loop' "$fixture/follow.tsv"; then
+              echo 'followed root symlink loop was traversed' >&2
+              exit 1
+            fi
+          fi
+
+  race:
+    name: nightly race detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up stable Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Run shuffled race-enabled tests
+        run: go test -race -shuffle=on ./... -count=1

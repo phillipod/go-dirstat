@@ -1,0 +1,74 @@
+name: Coverage
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '47 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: coverage / Go ${{ matrix.go-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version:
+          - '1.24.x'
+          - stable
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Collect coverage
+        run: go test -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+
+      - name: Render coverage reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          go tool cover -func=coverage.out | tee coverage.txt
+          go tool cover -html=coverage.out -o coverage.html
+          total="$(awk '$1 == "total:" { gsub("%", "", $3); print $3 }' coverage.txt)"
+          printf '%s\n' "$total" > coverage-total.txt
+          awk -v total="$total" 'BEGIN { if (total < 80) { printf "coverage %.1f%% is below the 80%% floor\n", total; exit 1 } }'
+          {
+            echo "### Go coverage (${{ matrix.go-version }})"
+            echo
+            echo "Total statement coverage: **${total}%**"
+            echo
+            echo "The full HTML and function reports are attached as workflow artifacts."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.go-version }}
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+            coverage-total.txt
+          if-no-files-found: error
+          retention-days: 14

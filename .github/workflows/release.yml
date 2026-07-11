@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semver tag to package and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must look like v1.2.3 or v1.2.3-rc.1; got: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+  verify:
+    name: verify release source
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Run release tests
+        run: go test ./... -count=1
+
+      - name: Run release vet
+        run: go vet ./...
+
+  build:
+    name: package / ${{ matrix.os }}-${{ matrix.arch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            suffix: ''
+            archive: tar.gz
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            suffix: ''
+            archive: tar.gz
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            suffix: ''
+            archive: tar.gz
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            suffix: ''
+            archive: tar.gz
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            suffix: .exe
+            archive: zip
+          - os: windows
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            suffix: .exe
+            archive: zip
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and package artifact
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          package_name="dirstat-${RELEASE_TAG}-${{ matrix.os }}-${{ matrix.arch }}"
+          binary_name="dirstat${{ matrix.suffix }}"
+          commit="$(git rev-parse HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p "package/$package_name" dist
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/phillipod/go-dirstat/internal/version.Version=$RELEASE_TAG -X github.com/phillipod/go-dirstat/internal/version.Commit=$commit -X github.com/phillipod/go-dirstat/internal/version.BuildDate=$build_date" \
+            -o "package/$package_name/$binary_name" ./cmd/dirstat
+          cp LICENSE README.md "package/$package_name/"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd package && zip -q -r "../dist/$package_name.zip" "$package_name")
+          else
+            tar -C package -czf "dist/$package_name.tar.gz" "$package_name"
+          fi
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: sha256sum dist/* | sort > dist/SHA256SUMS
+
+      - name: Publish release and assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --generate-notes
