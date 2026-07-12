@@ -76,7 +76,11 @@ func TestResolvedAliasPathFollowsJunctionTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.EqualFold(filepath.Clean(resolved), filepath.Clean(target)) {
-		t.Fatalf("resolvedAliasPath(%q) = %q, want target %q", alias, resolved, target)
+	resolvedTarget, err := resolvedAliasPath(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(filepath.Clean(resolved), filepath.Clean(resolvedTarget)) {
+		t.Fatalf("resolvedAliasPath(%q) = %q, want target %q", alias, resolved, resolvedTarget)
 	}
 }

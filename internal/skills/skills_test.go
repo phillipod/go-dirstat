@@ -101,6 +101,10 @@ func TestParseTargetsAndProfiles(t *testing.T) {
 
 func TestResolveScopesAndExplicitPaths(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
+	canonicalHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
 	locations, err := Resolve(ResolveOptions{
 		Targets: []Target{TargetCodex, TargetClaude}, Profiles: []Profile{ProfileReadOnly, ProfileOperator},
 		Scope: ScopeUser, Home: home, ProjectDir: project,
@@ -113,8 +117,8 @@ func TestResolveScopesAndExplicitPaths(t *testing.T) {
 		paths[location.Path] = true
 	}
 	for _, want := range []string{
-		filepath.Join(home, ".codex", "skills", "dirstat", "SKILL.md"),
-		filepath.Join(home, ".claude", "skills", "dirstat-operator", "SKILL.md"),
+		filepath.Join(canonicalHome, ".codex", "skills", "dirstat", "SKILL.md"),
+		filepath.Join(canonicalHome, ".claude", "skills", "dirstat-operator", "SKILL.md"),
 	} {
 		if !paths[want] {
 			t.Fatalf("resolved paths missing %q: %#v", want, locations)

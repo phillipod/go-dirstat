@@ -917,7 +917,7 @@ func resolveAliasTarget(path string, expected fs.FileInfo) (string, error) {
 func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, bool, error) {
 	p := filepath.Join(parent, e.Name())
 	if !s.opts.Policy.FollowSymlinks {
-		if runtime.GOOS == windowsOS {
+		if runtime.GOOS == windowsOS && e.Type()&fs.ModeIrregular != 0 {
 			// DirEntry.Info may describe a mount-point junction as a directory;
 			// use Lstat so the irregular reparse mode remains visible to the
 			// no-follow classifier and no target handle is opened here.
