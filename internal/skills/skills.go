@@ -5,6 +5,7 @@ package skills
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -89,6 +90,12 @@ type Location struct {
 	Target  Target
 	Profile Profile
 	Path    string
+
+	// scopeRoot is the canonical project root for project-scoped locations.
+	// Keeping the root with the resolved location lets read and mutation
+	// operations re-check the boundary instead of trusting a caller-provided
+	// path (or a path that changed after Resolve returned).
+	scopeRoot string
 }
 
 // Result records a completed installation or removal decision.
@@ -375,6 +382,31 @@ func Resolve(options ResolveOptions) ([]Location, error) {
 	if err != nil {
 		return nil, fmt.Errorf("project skill directory: %w", err)
 	}
+	projectRoot := ""
+	if options.Scope == ScopeProject {
+		projectRoot, err = resolveProjectRoot(projectDir)
+		if err != nil {
+			return nil, fmt.Errorf("project skill directory: %w", err)
+		}
+		// Build project locations from the resolved root. This avoids retaining
+		// a caller-visible symlink spelling that could be swapped after Resolve.
+		projectDir = projectRoot
+	}
+	userRoot := ""
+	if options.Scope == ScopeUser && hasDefaultSkillTarget(targets, options) {
+		if strings.TrimSpace(options.Home) == "" {
+			return nil, errors.New("user skill home is required")
+		}
+		home, err := absolute(options.Home)
+		if err != nil {
+			return nil, fmt.Errorf("user skill home: %w", err)
+		}
+		userRoot, err = resolveProjectRoot(home)
+		if err != nil {
+			return nil, fmt.Errorf("user skill home: %w", err)
+		}
+		options.Home = userRoot
+	}
 
 	locations := make([]Location, 0, len(targets)*len(profiles))
 	for _, target := range targets {
@@ -383,7 +415,15 @@ func Resolve(options ResolveOptions) ([]Location, error) {
 			if err != nil {
 				return nil, err
 			}
-			locations = append(locations, Location{Target: target, Profile: profile, Path: path})
+			scopeRoot := projectRoot
+			if options.Scope == ScopeUser && !hasSkillOverride(target, options) {
+				scopeRoot = userRoot
+			}
+			location := Location{Target: target, Profile: profile, Path: path, scopeRoot: scopeRoot}
+			if err := validateLocation(location); err != nil {
+				return nil, err
+			}
+			locations = append(locations, location)
 		}
 	}
 	if err := uniqueLocations(locations); err != nil {
@@ -409,10 +449,7 @@ func profileStrings(profiles []Profile) []string {
 }
 
 func targetPath(target Target, profile Profile, options ResolveOptions, projectDir string) (string, error) {
-	override := options.CodexPath
-	if target == TargetClaude {
-		override = options.ClaudePath
-	}
+	override := skillOverride(target, options)
 	if override != "" {
 		path, err := absolute(override)
 		if err != nil {
@@ -420,6 +457,11 @@ func targetPath(target Target, profile Profile, options ResolveOptions, projectD
 		}
 		if filepath.Base(path) != "SKILL.md" {
 			return "", fmt.Errorf("%s skill path %q must name SKILL.md", target, path)
+		}
+		if options.Scope == ScopeProject {
+			if err := ensureWithin(projectDir, path); err != nil {
+				return "", fmt.Errorf("%s skill path: %w", target, err)
+			}
 		}
 		return path, nil
 	}
@@ -444,6 +486,26 @@ func targetPath(target Target, profile Profile, options ResolveOptions, projectD
 		dir = ".claude"
 	}
 	return filepath.Join(root, dir, "skills", skillName(profile), "SKILL.md"), nil
+}
+
+func skillOverride(target Target, options ResolveOptions) string {
+	if target == TargetClaude {
+		return options.ClaudePath
+	}
+	return options.CodexPath
+}
+
+func hasSkillOverride(target Target, options ResolveOptions) bool {
+	return skillOverride(target, options) != ""
+}
+
+func hasDefaultSkillTarget(targets []Target, options ResolveOptions) bool {
+	for _, target := range targets {
+		if !hasSkillOverride(target, options) {
+			return true
+		}
+	}
+	return false
 }
 
 func skillName(profile Profile) string {
@@ -476,6 +538,196 @@ func absolute(path string) (string, error) {
 	return abs, nil
 }
 
+// resolveProjectRoot canonicalizes and validates a project root before any
+// project-scoped locations are constructed. A project scope must name an
+// existing directory: accepting a missing or non-directory path would make
+// the containment boundary ambiguous while creating it.
+func resolveProjectRoot(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%q is not a directory", path)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err = absolute(resolved)
+	if err != nil {
+		return "", err
+	}
+	resolvedInfo, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !resolvedInfo.IsDir() {
+		return "", fmt.Errorf("resolved project root %q is not a directory", resolved)
+	}
+	return resolved, nil
+}
+
+// ensureWithin checks lexical containment using filepath.Rel. The caller
+// should pass an absolute, cleaned root and path; this helper also rejects
+// paths on a different volume (where Rel reports an absolute result).
+func ensureWithin(root, path string) error {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return fmt.Errorf("path %q is outside project root %q", path, root)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("path %q is outside project root %q", path, root)
+	}
+	return nil
+}
+
+// validateLocation enforces the project boundary and rejects symlinked path
+// components. It is intentionally called before every read and mutation;
+// Resolve alone cannot protect a Location that is retained while a project
+// tree is changed by another process.
+func validateLocation(location Location) error {
+	if location.scopeRoot == "" {
+		return nil
+	}
+	root := filepath.Clean(location.scopeRoot)
+	path := filepath.Clean(location.Path)
+	if err := ensureWithin(root, path); err != nil {
+		return err
+	}
+	if err := rejectSymlinkComponents(root, path); err != nil {
+		return fmt.Errorf("skill path %q is not confined to project root %q: %w", path, root, err)
+	}
+	return nil
+}
+
+// rejectSymlinkComponents walks existing components without following them.
+// Missing descendants are allowed because Install creates them, but any
+// existing symlink or platform reparse point (including the final SKILL.md)
+// fails closed. The check is repeated immediately before mutation; project
+// writes then use os.Root for descriptor-relative operations instead of
+// path-based directory creation.
+func rejectSymlinkComponents(root, path string) error {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		return errors.New("project root is a symlink")
+	}
+	if !rootInfo.IsDir() {
+		return errors.New("project root is not a directory")
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	current := root
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if errors.Is(err, fs.ErrNotExist) {
+			// The rest of the path cannot currently be traversed. It will be
+			// created by Install through an os.Root anchored at the project.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return fmt.Errorf("component %q is a symlink or reparse point", current)
+		}
+		if current != path && !info.IsDir() {
+			return fmt.Errorf("component %q is not a directory", current)
+		}
+	}
+	return nil
+}
+
+// scopedPath opens a stable os.Root for a project-scoped location and returns
+// its root-relative name. os.Root resolves each component beneath the opened
+// directory and refuses links that escape it, so subsequent reads and
+// mutations do not follow a swapped .codex/.claude ancestor through a path.
+func scopedPath(location Location) (*os.Root, string, error) {
+	if err := validateLocation(location); err != nil {
+		return nil, "", err
+	}
+	root, err := openScopedRoot(location.scopeRoot)
+	if err != nil {
+		return nil, "", err
+	}
+	rel, err := filepath.Rel(filepath.Clean(location.scopeRoot), filepath.Clean(location.Path))
+	if err != nil {
+		_ = root.Close()
+		return nil, "", err
+	}
+	if rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		_ = root.Close()
+		return nil, "", fmt.Errorf("path %q is outside project root %q", location.Path, location.scopeRoot)
+	}
+	return root, rel, nil
+}
+
+// openScopedRoot anchors the canonical project directory through its parent
+// Root before opening the final component. This avoids following a symlink if
+// an attacker replaces the project path after validateLocation but before the
+// operation starts. Filesystems that use the volume/root itself as the parent
+// are opened directly.
+func openScopedRoot(path string) (*os.Root, error) {
+	path = filepath.Clean(path)
+	base := filepath.Base(path)
+	separator := string(filepath.Separator)
+	if base == "." || base == separator || base == filepath.VolumeName(path)+separator {
+		return os.OpenRoot(path)
+	}
+	parent, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	root, err := parent.OpenRoot(base)
+	closeErr := parent.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		_ = root.Close()
+		return nil, closeErr
+	}
+	return root, nil
+}
+
+func readLocation(location Location) ([]byte, error) {
+	if location.scopeRoot == "" {
+		return os.ReadFile(location.Path)
+	}
+	root, rel, err := scopedPath(location)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return root.ReadFile(rel)
+}
+
+func removeLocation(location Location) error {
+	if location.scopeRoot == "" {
+		return os.Remove(location.Path)
+	}
+	root, rel, err := scopedPath(location)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Remove(rel)
+}
+
 func uniqueLocations(locations []Location) error {
 	seen := make(map[string]Location, len(locations))
 	for _, location := range locations {
@@ -491,6 +743,9 @@ func uniqueLocations(locations []Location) error {
 func Status(locations []Location) ([]Result, error) {
 	results := make([]Result, 0, len(locations))
 	for _, location := range locations {
+		if err := validateLocation(location); err != nil {
+			return nil, fmt.Errorf("validate %s/%s skill %q: %w", location.Target, location.Profile, location.Path, err)
+		}
 		state, err := stateAt(location)
 		if err != nil {
 			return nil, fmt.Errorf("read %s/%s skill %q: %w", location.Target, location.Profile, location.Path, err)
@@ -526,7 +781,10 @@ func Install(locations []Location, rules string, force bool) ([]Result, error) {
 
 	for i := range states {
 		if states[i].State == StateInstalled {
-			matches, err := matchesDefinition(states[i].Location.Path, definitions[states[i].Location.Profile])
+			if err := validateLocation(states[i].Location); err != nil {
+				return nil, fmt.Errorf("validate %s/%s skill %q: %w", states[i].Location.Target, states[i].Location.Profile, states[i].Location.Path, err)
+			}
+			matches, err := matchesDefinition(states[i].Location, definitions[states[i].Location.Profile])
 			if err != nil {
 				return nil, fmt.Errorf("read %s/%s skill %q: %w", states[i].Location.Target, states[i].Location.Profile, states[i].Location.Path, err)
 			}
@@ -534,7 +792,7 @@ func Install(locations []Location, rules string, force bool) ([]Result, error) {
 				continue
 			}
 		}
-		if err := writeAtomic(states[i].Location.Path, definitions[states[i].Location.Profile]); err != nil {
+		if err := writeAtomicLocation(states[i].Location, definitions[states[i].Location.Profile]); err != nil {
 			return nil, fmt.Errorf("install %s/%s skill %q: %w", states[i].Location.Target, states[i].Location.Profile, states[i].Location.Path, err)
 		}
 		states[i].State, states[i].Changed = StateInstalled, true
@@ -542,8 +800,8 @@ func Install(locations []Location, rules string, force bool) ([]Result, error) {
 	return states, nil
 }
 
-func matchesDefinition(path string, want []byte) (bool, error) {
-	data, err := os.ReadFile(path)
+func matchesDefinition(location Location, want []byte) (bool, error) {
+	data, err := readLocation(location)
 	if err != nil {
 		return false, err
 	}
@@ -566,7 +824,10 @@ func Remove(locations []Location, force bool) ([]Result, error) {
 		if states[i].State == StateMissing {
 			continue
 		}
-		if err := os.Remove(states[i].Location.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := validateLocation(states[i].Location); err != nil {
+			return nil, fmt.Errorf("validate %s/%s skill %q: %w", states[i].Location.Target, states[i].Location.Profile, states[i].Location.Path, err)
+		}
+		if err := removeLocation(states[i].Location); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("remove %s/%s skill %q: %w", states[i].Location.Target, states[i].Location.Profile, states[i].Location.Path, err)
 		}
 		states[i].State, states[i].Changed = StateMissing, true
@@ -575,7 +836,10 @@ func Remove(locations []Location, force bool) ([]Result, error) {
 }
 
 func stateAt(location Location) (State, error) {
-	data, err := os.ReadFile(location.Path)
+	if err := validateLocation(location); err != nil {
+		return "", err
+	}
+	data, err := readLocation(location)
 	if errors.Is(err, fs.ErrNotExist) {
 		return StateMissing, nil
 	}
@@ -615,11 +879,35 @@ func managedState(data []byte, profile Profile) State {
 	return StateInstalled
 }
 
-func writeAtomic(path string, data []byte) (err error) {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func writeAtomicLocation(location Location, data []byte) error {
+	if err := validateLocation(location); err != nil {
 		return err
 	}
+	if location.scopeRoot == "" {
+		dir := filepath.Dir(location.Path)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		return writeAtomicUnscoped(location.Path, data)
+	}
+
+	root, rel, err := scopedPath(location)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	dir := filepath.Dir(rel)
+	if dir == "." {
+		dir = ""
+	}
+	if err := root.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return writeAtomicRoot(root, dir, filepath.Base(rel), data)
+}
+
+func writeAtomicUnscoped(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".dirstat-skill-*.tmp")
 	if err != nil {
 		return err
@@ -642,4 +930,64 @@ func writeAtomic(path string, data []byte) (err error) {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func writeAtomicRoot(root *os.Root, dir, name string, data []byte) error {
+	for attempt := 0; attempt < 16; attempt++ {
+		var token [16]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return fmt.Errorf("generate temporary skill name: %w", err)
+		}
+		tmpName := ".dirstat-skill-" + hex.EncodeToString(token[:]) + ".tmp"
+		tmpRel := tmpName
+		if dir != "" {
+			tmpRel = filepath.Join(dir, tmpName)
+		}
+		tmp, err := root.OpenFile(tmpRel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		removeTemp := true
+		closed := false
+		func() {
+			defer func() {
+				if !closed {
+					_ = tmp.Close()
+				}
+				if removeTemp {
+					_ = root.Remove(tmpRel)
+				}
+			}()
+			if _, err = tmp.Write(data); err != nil {
+				return
+			}
+			if err = tmp.Chmod(0o644); err != nil {
+				return
+			}
+			if err = tmp.Sync(); err != nil {
+				return
+			}
+			err = tmp.Close()
+			closed = true
+			if err != nil {
+				return
+			}
+			destination := name
+			if dir != "" {
+				destination = filepath.Join(dir, name)
+			}
+			err = root.Rename(tmpRel, destination)
+			if err == nil {
+				removeTemp = false
+			}
+		}()
+		if err == nil {
+			return nil
+		}
+		return err
+	}
+	return errors.New("could not allocate a temporary skill file")
 }

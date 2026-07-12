@@ -424,6 +424,78 @@ func TestReadDirErrorRetainsKnownDirectoryMetadata(t *testing.T) {
 	}
 }
 
+func TestFollowedAliasTargetResolutionRejectsReplacement(t *testing.T) {
+	base := t.TempDir()
+	first := filepath.Join(base, "first")
+	second := filepath.Join(base, "second")
+	alias := filepath.Join(base, "alias")
+	if err := os.Mkdir(first, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(first, alias); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	expected, err := os.Stat(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveAliasTarget(alias, expected); err == nil {
+		t.Fatal("replacement alias was accepted as the originally checked target")
+	}
+}
+
+func TestFollowedDirectoryAliasIsNotTraversedAfterTargetReplacement(t *testing.T) {
+	base := t.TempDir()
+	first := filepath.Join(base, "first")
+	second := filepath.Join(base, "second")
+	alias := filepath.Join(base, "alias")
+	if err := os.Mkdir(first, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(first, alias); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	expected, err := os.Stat(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &tree.Node{Name: "alias", IsDir: true}
+	s := &scanner{
+		ctx:  context.Background(),
+		opts: Options{Policy: scope.New(scope.WithFollowSymlinks(true)), Concurrency: 1},
+		sem:  make(chan struct{}, 1),
+		openDir: func(path string) (directoryReader, error) {
+			if err := os.Remove(alias); err != nil {
+				return nil, err
+			}
+			if err := os.Symlink(second, alias); err != nil {
+				return nil, err
+			}
+			return os.Open(path)
+		},
+	}
+	lt := &liveTree{root: root}
+	s.scanDir(alias, "", expected, devOfPath(alias, expected), "", 0, root, nil, lt)
+	if root.Err == nil || !strings.Contains(root.Err.Error(), "changed while opening") {
+		t.Fatalf("replaced directory target was traversed: root=%+v", root)
+	}
+	if s.errors != 1 {
+		t.Fatalf("scan errors = %d, want 1", s.errors)
+	}
+}
+
 // TestScanConcurrencySanity re-scans the repo itself under the race detector
 // implicitly (go test -race) to shake out goroutine/data-race bugs in the
 // aggregation step on a non-trivial tree.

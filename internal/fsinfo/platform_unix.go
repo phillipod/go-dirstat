@@ -20,14 +20,14 @@ func allocatedBytes(info fs.FileInfo) int64 {
 	return info.Size()
 }
 
-func identity(_ string, info fs.FileInfo) Identity {
+func identity(_ string, info fs.FileInfo, _ bool) Identity {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		return Identity{Device: uint64(st.Dev), File: uint64(st.Ino), Valid: true}
 	}
 	return Identity{}
 }
 
-func linkCount(_ string, info fs.FileInfo) uint64 {
+func linkCount(_ string, info fs.FileInfo, _ bool) uint64 {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		return uint64(st.Nlink)
 	}

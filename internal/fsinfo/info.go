@@ -103,7 +103,7 @@ func Inspect(path string, follow bool) (Entry, error) {
 		Path: abs, Name: info.Name(), Kind: kind,
 		Mode: uint32(info.Mode()), ModeText: info.Mode().String(),
 		Size: info.Size(), Allocated: allocatedBytes(info), ModTime: info.ModTime(),
-		Identity: identity(abs, info), Links: linkCount(abs, info),
+		Identity: identity(abs, info, follow), Links: linkCount(abs, info, follow),
 		Executable: info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0,
 	}
 	e.UID, e.GID, e.Owner, e.Group = ownership(info)

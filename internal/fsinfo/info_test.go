@@ -59,6 +59,17 @@ func TestInspectSymlinkDoesNotFollowByDefault(t *testing.T) {
 	if e.Kind != "symlink" || e.Symlink == "" {
 		t.Fatalf("symlink entry = %+v", e)
 	}
+	// A no-follow inspection must not report the target's stable identity. On
+	// Windows this guards the metadata handle against accidentally opening the
+	// final symlink/reparse target with ordinary os.Open semantics.
+	targetEntry, err := Inspect(target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Identity.Valid && targetEntry.Identity.Valid &&
+		e.Identity.Device == targetEntry.Identity.Device && e.Identity.File == targetEntry.Identity.File {
+		t.Fatalf("no-follow symlink reused target identity: link=%+v target=%+v", e.Identity, targetEntry.Identity)
+	}
 }
 
 func TestCapturePathRecordsAbsenceAndIdentity(t *testing.T) {

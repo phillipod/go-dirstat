@@ -121,7 +121,7 @@ func TestResolveScopesAndExplicitPaths(t *testing.T) {
 		}
 	}
 
-	explicit := filepath.Join(t.TempDir(), "custom", "SKILL.md")
+	explicit := filepath.Join(project, "custom", "SKILL.md")
 	locations, err = Resolve(ResolveOptions{
 		Targets: []Target{TargetCodex}, Profiles: []Profile{ProfileAdministrator}, Scope: ScopeProject,
 		ProjectDir: project, CodexPath: explicit,
@@ -129,11 +129,93 @@ func TestResolveScopesAndExplicitPaths(t *testing.T) {
 	if err != nil || len(locations) != 1 || locations[0].Path != explicit {
 		t.Fatalf("explicit locations = %#v, %v", locations, err)
 	}
+	outside := filepath.Join(t.TempDir(), "custom", "SKILL.md")
+	if _, err := Resolve(ResolveOptions{
+		Targets: []Target{TargetCodex}, Profiles: []Profile{ProfileReadOnly}, Scope: ScopeProject,
+		ProjectDir: project, CodexPath: outside,
+	}); err == nil || !strings.Contains(err.Error(), "outside project root") {
+		t.Fatalf("outside explicit path error = %v", err)
+	}
 	if _, err := Resolve(ResolveOptions{
 		Targets: []Target{TargetCodex, TargetClaude}, Profiles: []Profile{ProfileReadOnly}, Scope: ScopeProject,
-		CodexPath: explicit, ClaudePath: explicit,
+		ProjectDir: project, CodexPath: explicit, ClaudePath: explicit,
 	}); err == nil || !strings.Contains(err.Error(), "both resolve") {
 		t.Fatalf("duplicate explicit path error = %v", err)
+	}
+}
+
+func TestProjectScopeRejectsSymlinkedSkillAncestors(t *testing.T) {
+	project := t.TempDir()
+	outside := t.TempDir()
+	for _, agentDir := range []string{".codex", ".claude"} {
+		target := TargetCodex
+		if agentDir == ".claude" {
+			target = TargetClaude
+		}
+		link := filepath.Join(project, agentDir)
+		if err := os.Symlink(outside, link); err != nil {
+			t.Skipf("directory symlinks unavailable: %v", err)
+		}
+		_, err := Resolve(ResolveOptions{
+			Targets: []Target{target}, Profiles: []Profile{ProfileReadOnly}, Scope: ScopeProject,
+			ProjectDir: project,
+		})
+		if err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("Resolve accepted symlinked %s: %v", agentDir, err)
+		}
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Symlink(outside, link); err != nil {
+			t.Skipf("directory symlinks unavailable: %v", err)
+		}
+		location := Location{
+			Target: target, Profile: ProfileReadOnly,
+			Path:      filepath.Join(project, agentDir, "skills", "dirstat", "SKILL.md"),
+			scopeRoot: project,
+		}
+		outsideSkill := filepath.Join(outside, "skills", "dirstat", "SKILL.md")
+		if err := os.MkdirAll(filepath.Dir(outsideSkill), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		definition, err := Definition(ProfileReadOnly, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(outsideSkill, definition, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Status([]Location{location}); err == nil {
+			t.Fatalf("Status accepted symlinked %s", agentDir)
+		}
+		if _, err := Install([]Location{location}, "", false); err == nil {
+			t.Fatalf("Install accepted symlinked %s", agentDir)
+		}
+		if _, err := Remove([]Location{location}, false); err == nil {
+			t.Fatalf("Remove accepted symlinked %s", agentDir)
+		}
+		if _, err := os.Stat(outsideSkill); err != nil {
+			t.Fatalf("outside skill was changed or removed through %s: %v", agentDir, err)
+		}
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUserScopeRejectsSymlinkedDefaultSkillAncestor(t *testing.T) {
+	home := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(home, ".codex")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	_, err := Resolve(ResolveOptions{
+		Targets: []Target{TargetCodex}, Profiles: []Profile{ProfileReadOnly}, Scope: ScopeUser, Home: home,
+	})
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Resolve accepted user skill symlink: %v", err)
 	}
 }
 

@@ -52,8 +52,16 @@ func linkCount(info fs.FileInfo) uint64 {
 // already carries everything needed, so no extra I/O is required here.
 func devOfPath(_ string, info fs.FileInfo) uint64 { return devOf(info) }
 
+func devOfPathNoFollow(_ string, info fs.FileInfo) uint64 { return devOf(info) }
+
 func identityOfPath(_ string, info fs.FileInfo) (dev, ino uint64, ok bool) {
 	return identityOf(info)
 }
 
+func identityOfPathNoFollow(_ string, info fs.FileInfo) (dev, ino uint64, ok bool) {
+	return identityOf(info)
+}
+
 func linkCountPath(_ string, info fs.FileInfo) uint64 { return linkCount(info) }
+
+func linkCountPathNoFollow(_ string, info fs.FileInfo) uint64 { return linkCount(info) }

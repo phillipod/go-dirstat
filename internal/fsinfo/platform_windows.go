@@ -13,8 +13,8 @@ import (
 
 func allocatedBytes(info fs.FileInfo) int64 { return info.Size() }
 
-func identity(path string, _ fs.FileInfo) Identity {
-	f, err := os.Open(path)
+func identity(path string, info fs.FileInfo, follow bool) Identity {
+	f, err := openMetadataHandle(path, info, follow)
 	if err != nil {
 		return Identity{}
 	}
@@ -29,8 +29,8 @@ func identity(path string, _ fs.FileInfo) Identity {
 	}
 }
 
-func linkCount(path string, _ fs.FileInfo) uint64 {
-	f, err := os.Open(path)
+func linkCount(path string, info fs.FileInfo, follow bool) uint64 {
+	f, err := openMetadataHandle(path, info, follow)
 	if err != nil {
 		return 0
 	}
@@ -47,6 +47,48 @@ func ownership(fs.FileInfo) (string, string, string, string) { return "", "", ""
 // OwnershipAvailable is false until Windows SID lookup is implemented. Query
 // surfaces use this capability to reject misleading empty ownership results.
 func OwnershipAvailable() bool { return false }
+
+// openMetadataHandle obtains a handle for identity and link-count queries.
+// Windows follows a symlink or mount-point reparse point when a path is opened
+// normally. That is appropriate when Inspect intentionally followed the final
+// alias, but it would violate Inspect's default no-follow contract when the
+// FileInfo came from Lstat. Open the reparse point itself in that case so a
+// metadata query cannot touch its target (including a UNC path).
+func openMetadataHandle(path string, info fs.FileInfo, follow bool) (*os.File, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	attributes := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS)
+	if !follow || (info != nil && metadataReparseMode(info.Mode())) {
+		attributes |= windows.FILE_FLAG_OPEN_REPARSE_POINT
+	}
+	handle, err := windows.CreateFile(
+		name,
+		windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		attributes,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(handle), path)
+	if f == nil {
+		_ = windows.CloseHandle(handle)
+		return nil, os.ErrInvalid
+	}
+	return f, nil
+}
+
+// Go reports ordinary Windows symlinks as ModeSymlink and mount-point
+// junctions as ModeIrregular. Both modes identify an alias when the metadata
+// was collected without following the final path component.
+func metadataReparseMode(mode fs.FileMode) bool {
+	return mode&(fs.ModeSymlink|fs.ModeIrregular) != 0
+}
 
 func platformVolumeFor(path string) (Volume, error) {
 	p, err := windows.UTF16PtrFromString(path)

@@ -132,11 +132,14 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 					return nil, Stats{}, err
 				}
 			}
-			// Resolve the path for filesystem-type lookup. The tree keeps the
-			// user-supplied symlink name, while traversal and accounting use the
-			// target's metadata, just like followed symlinks below the root.
-			if resolved, resolveErr := filepath.EvalSymlinks(rootAbs); resolveErr == nil {
-				rootFSPath = resolved
+			// Resolve the path for filesystem and path policy from the same
+			// target identity that was returned by Stat. Windows mount-point
+			// junctions are ModeIrregular and filepath.EvalSymlinks preserves
+			// their alias spelling, so the platform resolver uses a followed
+			// handle to obtain the actual target path.
+			rootFSPath, err = resolveAliasTarget(rootAbs, info)
+			if err != nil {
+				return nil, Stats{}, fmt.Errorf("resolve scan root alias %q: %w", rootDisplay, err)
 			}
 		}
 	}
@@ -210,7 +213,15 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 
 	start := time.Now()
 	var node *tree.Node
-	if info.IsDir() {
+	rootIsDir := info.IsDir()
+	if !opts.Policy.FollowSymlinks && runtime.GOOS == windowsOS && info.Mode()&fs.ModeIrregular != 0 {
+		// Windows mount-point junctions can report ModeDir together with
+		// ModeIrregular. Treat them as non-traversable aliases when --follow is
+		// disabled; otherwise the initial scan root would still be opened and
+		// followed even though child metadata uses no-follow handles.
+		rootIsDir = false
+	}
+	if rootIsDir {
 		s.startStatWorkers(opts.Concurrency)
 		node = &tree.Node{Name: filepath.Base(rootAbs), IsDir: true, Depth: 0}
 		var rootGroup *dirGroup
@@ -218,7 +229,11 @@ func ScanStream(ctx context.Context, root string, opts Options, p Progress) (*tr
 			rootGroup = s.registerRootDirectory(rootFSPath, info, node)
 		}
 		lt.root = node
-		s.scanDir(rootAbs, "", info, devOfPath(rootAbs, info), rootFS, 0, node, rootGroup, lt)
+		rootDev := devOfPath(rootAbs, info)
+		if !opts.Policy.FollowSymlinks {
+			rootDev = devOfPathNoFollow(rootAbs, info)
+		}
+		s.scanDir(rootAbs, "", info, rootDev, rootFS, 0, node, rootGroup, lt)
 		s.stopStatWorkers()
 		// Identity discovery is concurrent and therefore provisional. Select final
 		// directory and file owners only after traversal, then rebuild aggregates
@@ -556,6 +571,20 @@ func (s *scanner) scanDir(abs, rel string, info fs.FileInfo, dev uint64, fstype 
 		return
 	}
 	defer func() { _ = dir.Close() }()
+	if statter, ok := dir.(interface{ Stat() (fs.FileInfo, error) }); ok {
+		openedInfo, statErr := statter.Stat()
+		if statErr != nil {
+			atomic.AddInt64(&s.errors, 1)
+			lt.record(func() { n.Err = statErr })
+			return
+		}
+		if !os.SameFile(info, openedInfo) {
+			err := fmt.Errorf("directory target changed while opening %q", abs)
+			atomic.AddInt64(&s.errors, 1)
+			lt.record(func() { n.Err = err })
+			return
+		}
+	}
 
 	for {
 		if err := s.ctx.Err(); err != nil {
@@ -734,11 +763,30 @@ func (s *scanner) classifyEntry(abs, rel string, parentDev uint64, parentFS stri
 		return s.errorNode(r.name, r.err, depth+1), nil
 	}
 	info := r.info
+	if !s.opts.Policy.FollowSymlinks && runtime.GOOS == windowsOS && info.Mode()&fs.ModeIrregular != 0 && info.IsDir() {
+		// A mount-point junction is an alias even though Go reports its mode as
+		// a directory. Keep default no-follow scans from opening it as a child.
+		return nil, nil
+	}
 	targetPath := eabs
 	if r.resolved != "" {
 		targetPath = r.resolved
+		// The stat worker resolved and identity-checked the alias before
+		// handing it to classification. Recheck the visible path here so a
+		// target swap between the worker and the policy decision is rejected
+		// instead of being evaluated against a stale resolved path.
+		currentInfo, statErr := os.Stat(eabs)
+		if statErr != nil || !os.SameFile(info, currentInfo) {
+			if statErr == nil {
+				statErr = fmt.Errorf("target identity changed")
+			}
+			return s.errorNode(r.name, fmt.Errorf("followed alias %q changed before policy check: %w", eabs, statErr), depth+1), nil
+		}
 	}
 	childDev := devOfPath(eabs, info)
+	if !s.opts.Policy.FollowSymlinks {
+		childDev = devOfPathNoFollow(eabs, info)
+	}
 	childFS := parentFS
 	if childDev != parentDev || r.resolved != "" {
 		childFS = s.fstypeOf(targetPath)
@@ -833,7 +881,7 @@ func (s *scanner) runStatTask(task statTask) {
 	info, alias, err := s.statEntry(task.parent, task.entry)
 	resolved := ""
 	if err == nil && s.opts.Policy.FollowSymlinks && alias {
-		resolved, _ = filepath.EvalSymlinks(filepath.Join(task.parent, task.entry.Name()))
+		resolved, err = resolveAliasTarget(filepath.Join(task.parent, task.entry.Name()), info)
 	}
 	if s.ctx.Err() != nil {
 		return
@@ -843,6 +891,25 @@ func (s *scanner) runStatTask(task statTask) {
 	}
 }
 
+// resolveAliasTarget returns the canonical path for the object currently
+// returned by Stat(path). The identity check closes the common race where an
+// alias is replaced between stat and path resolution; callers that later open
+// the alias still validate the opened directory handle before reading it.
+func resolveAliasTarget(path string, expected fs.FileInfo) (string, error) {
+	resolved, err := resolvedAliasPath(path)
+	if err != nil {
+		return "", err
+	}
+	actual, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !os.SameFile(expected, actual) {
+		return "", fmt.Errorf("alias target changed while resolving %q", path)
+	}
+	return filepath.Clean(resolved), nil
+}
+
 // statEntry stats a single entry, following symlinks when configured. The
 // returned alias bit records whether the visible path was a link/reparse alias
 // so callers can resolve the target for boundary and identity checks without
@@ -850,6 +917,13 @@ func (s *scanner) runStatTask(task statTask) {
 func (s *scanner) statEntry(parent string, e os.DirEntry) (fs.FileInfo, bool, error) {
 	p := filepath.Join(parent, e.Name())
 	if !s.opts.Policy.FollowSymlinks {
+		if runtime.GOOS == windowsOS {
+			// DirEntry.Info may describe a mount-point junction as a directory;
+			// use Lstat so the irregular reparse mode remains visible to the
+			// no-follow classifier and no target handle is opened here.
+			info, err := os.Lstat(p)
+			return info, false, err
+		}
 		info, err := e.Info()
 		return info, false, err
 	}
@@ -931,7 +1005,7 @@ func directoryIdentity(path string, info fs.FileInfo) dirKey {
 		return dirKey{dev: dev, ino: ino}
 	}
 	if runtime.GOOS == windowsOS {
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		if resolved, err := resolvedAliasPath(path); err == nil {
 			return dirKey{path: canonicalPath(resolved)}
 		}
 	}
@@ -939,7 +1013,7 @@ func directoryIdentity(path string, info fs.FileInfo) dirKey {
 }
 
 func fallbackDirectoryIdentity(path string) dirKey {
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := resolvedAliasPath(path)
 	if err != nil {
 		resolved = path
 	}
@@ -1113,8 +1187,14 @@ func (s *scanner) deduplicatedFile(abs, resolved, name string, info fs.FileInfo,
 }
 
 func (s *scanner) fileIdentity(abs, resolved string, info fs.FileInfo) (fileKey, bool) {
-	if dev, ino, ok := identityOfPath(abs, info); ok {
-		if s.opts.Policy.FollowSymlinks || linkCountPath(abs, info) > 1 {
+	identityFn := identityOfPath
+	linkCountFn := linkCountPath
+	if !s.opts.Policy.FollowSymlinks {
+		identityFn = identityOfPathNoFollow
+		linkCountFn = linkCountPathNoFollow
+	}
+	if dev, ino, ok := identityFn(abs, info); ok {
+		if s.opts.Policy.FollowSymlinks || linkCountFn(abs, info) > 1 {
 			return fileKey{dev: dev, ino: ino}, true
 		}
 		return fileKey{}, false
@@ -1126,7 +1206,7 @@ func (s *scanner) fileIdentity(abs, resolved string, info fs.FileInfo) (fileKey,
 	target := resolved
 	if target == "" {
 		var err error
-		target, err = filepath.EvalSymlinks(abs)
+		target, err = resolvedAliasPath(abs)
 		if err != nil {
 			target = abs
 		}
