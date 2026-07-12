@@ -105,6 +105,10 @@ func TestResolveScopesAndExplicitPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	canonicalProject, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
 	locations, err := Resolve(ResolveOptions{
 		Targets: []Target{TargetCodex, TargetClaude}, Profiles: []Profile{ProfileReadOnly, ProfileOperator},
 		Scope: ScopeUser, Home: home, ProjectDir: project,
@@ -126,11 +130,12 @@ func TestResolveScopesAndExplicitPaths(t *testing.T) {
 	}
 
 	explicit := filepath.Join(project, "custom", "SKILL.md")
+	expectedExplicit := filepath.Join(canonicalProject, "custom", "SKILL.md")
 	locations, err = Resolve(ResolveOptions{
 		Targets: []Target{TargetCodex}, Profiles: []Profile{ProfileAdministrator}, Scope: ScopeProject,
 		ProjectDir: project, CodexPath: explicit,
 	})
-	if err != nil || len(locations) != 1 || locations[0].Path != explicit {
+	if err != nil || len(locations) != 1 || locations[0].Path != expectedExplicit {
 		t.Fatalf("explicit locations = %#v, %v", locations, err)
 	}
 	outside := filepath.Join(t.TempDir(), "custom", "SKILL.md")

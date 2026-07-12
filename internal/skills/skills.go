@@ -459,6 +459,16 @@ func targetPath(target Target, profile Profile, options ResolveOptions, projectD
 			return "", fmt.Errorf("%s skill path %q must name SKILL.md", target, path)
 		}
 		if options.Scope == ScopeProject {
+			// The project root is canonicalized before this function is called.
+			// Canonicalize the existing parent of an explicit path as well so
+			// harmless platform spellings such as macOS /var or Windows 8.3
+			// aliases do not look outside the canonical root. The final component
+			// is kept unresolved so validateLocation can reject a symlinked
+			// SKILL.md rather than following it.
+			path, err = canonicalizeExistingParent(path)
+			if err != nil {
+				return "", fmt.Errorf("%s skill path: %w", target, err)
+			}
 			if err := ensureWithin(projectDir, path); err != nil {
 				return "", fmt.Errorf("%s skill path: %w", target, err)
 			}
@@ -536,6 +546,55 @@ func absolute(path string) (string, error) {
 		return "", err
 	}
 	return abs, nil
+}
+
+// canonicalizeExistingParent resolves the existing portion of path while
+// preserving its final component. Skill files are often created on demand, so
+// resolving the complete path would either fail for a missing file or follow
+// an existing SKILL.md symlink before validateLocation can reject it.
+func canonicalizeExistingParent(path string) (string, error) {
+	path, err := absolute(path)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(path)
+	parent, err := canonicalizeExistingPath(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, base), nil
+}
+
+func canonicalizeExistingPath(path string) (string, error) {
+	path, err := absolute(path)
+	if err != nil {
+		return "", err
+	}
+	missing := make([]string, 0, 4)
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return "", err
+			}
+			resolved, err = absolute(resolved)
+			if err != nil {
+				return "", err
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", fmt.Errorf("no existing ancestor for %q", path)
+		}
+		missing = append(missing, filepath.Base(path))
+		path = parent
+	}
 }
 
 // resolveProjectRoot canonicalizes and validates a project root before any
